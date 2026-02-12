@@ -20,6 +20,7 @@
     "multer": "^2.0.2",
     "plotly.js-dist-min": "^3.3.1",
     "react-plotly.js": "^2.6.0",
-    "redis": "^5.10.0"
+    "redis": "^5.10.0",
+    "zod": "^4.3.6"
   }
 }

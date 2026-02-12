@@ -9,6 +9,8 @@ import { connectMongo } from "./db/mongo.js";
 import { connectRedis } from "./db/redis.js";
 import wellsRouter from "./routes/wells.js";
 import "dotenv/config";
+import aiRoutes from "./routes/ai.js";
+import "dotenv/config";
 
 const app = express();
 app.use(cors());
@@ -109,6 +111,9 @@ app.post("/api/las/upload", upload.single("file"), async (req, res) => {
     return res.status(500).json({ error: err.message || "Upload/parse failed" });
   }
 });
+
+app.use("/api/ai", aiRoutes);
+app.use(express.json());
 
 app.get("/api/wells", (req, res) => {
   const wells = [...wellsData.values()].map((w) => ({
