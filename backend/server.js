@@ -11,10 +11,12 @@ import wellsRouter from "./routes/wells.js";
 import "dotenv/config";
 import aiRoutes from "./routes/ai.js";
 import "dotenv/config";
+import aiRouter from "./routes/ai.js";
+
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const upload = multer({ dest: "uploads/" });
 
@@ -31,7 +33,6 @@ function sanitizeValues(valuesObj) {
 }
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
 app.use(compression());
 
 app.get("/api/health", (req, res) => {
@@ -39,6 +40,9 @@ app.get("/api/health", (req, res) => {
 });
 
 app.use("/api", wellsRouter);
+
+app.use("/api/ai", aiRouter);
+
 
 const PORT = process.env.PORT || 5000;
 
@@ -113,7 +117,6 @@ app.post("/api/las/upload", upload.single("file"), async (req, res) => {
 });
 
 app.use("/api/ai", aiRoutes);
-app.use(express.json());
 
 app.get("/api/wells", (req, res) => {
   const wells = [...wellsData.values()].map((w) => ({

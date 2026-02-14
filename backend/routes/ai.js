@@ -1,5 +1,13 @@
 import express from "express";
 import { callAiInterpret } from "../services/aiClient.js";
+import {
+  insertInterpretationRun,
+  getInterpretationRunById,
+  listInterpretationRuns,
+} from "../repositories/interpretationRunsRepo.js";
+// import { pgPool } from "../db/postgres.js"; // optional: only if you want /_db-check
+import { jsonrepair } from "jsonrepair";
+
 
 const router = express.Router();
 
@@ -32,7 +40,7 @@ function pickLimitations(det) {
   return ["Deterministic analysis only."];
 }
 
-/** Convert deterministic interval -> narrative interval shape with extra fields */
+/** deterministic interval -> narrative interval shape with enriched fields */
 function detFindingToNarrativeInterval(f) {
   const reason = f?.reason || "anomaly";
   const score = f?.score;
@@ -48,7 +56,6 @@ function detFindingToNarrativeInterval(f) {
     confidence: conf ?? null,
     priority: f?.priority || "watch",
 
-    // critical enriched fields
     probability: f?.probability ?? null,
     stability: f?.stability ?? null,
     stabilityScore: f?.stabilityScore ?? null,
@@ -75,42 +82,53 @@ function fallbackNarrativeFromDeterministic(deterministic) {
 
 /** Extract JSON object safely from LLM content */
 function parseJsonFromModelContent(content) {
-  // 1) direct JSON
-  try {
-    return JSON.parse(content);
-  } catch {
-    // continue
+  const candidates = [];
+
+  // A) raw content
+  if (typeof content === "string" && content.trim()) {
+    candidates.push(content.trim());
   }
 
-  // 2) fenced block ```json ... ```
-  const fenceMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  // B) fenced block
+  const fenceMatch = content?.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenceMatch?.[1]) {
+    candidates.push(fenceMatch[1].trim());
+  }
+
+  // C) largest {...} slice
+  const start = content?.indexOf("{");
+  const end = content?.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    candidates.push(content.slice(start, end + 1).trim());
+  }
+
+  for (const raw of candidates) {
+    // 1) strict parse
     try {
-      return JSON.parse(fenceMatch[1]);
+      return JSON.parse(raw);
+    } catch {
+      // continue
+    }
+
+    // 2) repair then parse
+    try {
+      const repaired = jsonrepair(raw);
+      return JSON.parse(repaired);
     } catch {
       // continue
     }
   }
 
-  // 3) first {...} block
-  const start = content.indexOf("{");
-  const end = content.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    return JSON.parse(content.slice(start, end + 1));
-  }
-
-  throw new Error("Model content is not valid JSON");
+  throw new Error("Model content is not valid/repairable JSON");
 }
+
 
 function num(x, def = NaN) {
   const v = Number(x);
   return Number.isFinite(v) ? v : def;
 }
 
-/**
- * Score similarity between two intervals.
- * Used to map LLM intervals back to deterministic ones when fields are missing.
- */
+/** Similarity score for interval matching (LLM interval -> deterministic interval) */
 function intervalSimilarity(a, b) {
   const a0 = num(a?.fromDepth);
   const a1 = num(a?.toDepth);
@@ -129,17 +147,18 @@ function intervalSimilarity(a, b) {
   const midDist = Math.abs(midA - midB);
   const widthDist = Math.abs(widthA - widthB);
 
-  // smaller is better; curve match bonus
+  // smaller distance is better; add curve-match bonus
   let score = -midDist - 0.35 * widthDist;
   if (aCurve && bCurve && aCurve === bCurve) score += 12;
-  if (aCurve && bCurve && (aCurve.includes(bCurve) || bCurve.includes(aCurve))) score += 6;
+  if (aCurve && bCurve && (aCurve.includes(bCurve) || bCurve.includes(aCurve)))
+    score += 6;
 
   return score;
 }
 
 /**
- * Merge LLM interval_explanations with deterministic intervals
- * so required fields are always present.
+ * Merge LLM intervals with deterministic intervals so required fields are always present.
+ * Also appends deterministic intervals that LLM might have dropped.
  */
 function mergeNarrativeIntervals(llmIntervals, deterministic) {
   const detIntervals = Array.isArray(deterministic?.intervalFindings)
@@ -148,15 +167,14 @@ function mergeNarrativeIntervals(llmIntervals, deterministic) {
 
   const detNormalized = detIntervals.map(detFindingToNarrativeInterval);
 
-  // If llm gave nothing useful, fallback directly
   if (!Array.isArray(llmIntervals) || llmIntervals.length === 0) {
     return detNormalized;
   }
 
   const merged = llmIntervals.map((it) => {
-    // best deterministic match by interval similarity
     let best = null;
     let bestScore = -Infinity;
+
     for (const d of detNormalized) {
       const s = intervalSimilarity(it, d);
       if (s > bestScore) {
@@ -189,27 +207,26 @@ function mergeNarrativeIntervals(llmIntervals, deterministic) {
     };
   });
 
-  // If LLM dropped some deterministic intervals, append remaining deterministic items
-  const usedDetKeys = new Set(
+  // append deterministic intervals not represented by merged LLM intervals
+  const usedKeys = new Set(
     merged.map(
       (m) =>
-        `${Math.round(num(m.fromDepth, -1))}::${Math.round(num(m.toDepth, -1))}::${String(
-          m.curve || ""
-        )}`
+        `${Math.round(num(m.fromDepth, -1))}::${Math.round(
+          num(m.toDepth, -1)
+        )}::${String(m.curve || "")}`
     )
   );
 
   for (const d of detNormalized) {
-    const k = `${Math.round(num(d.fromDepth, -1))}::${Math.round(num(d.toDepth, -1))}::${String(
-      d.curve || ""
-    )}`;
-    if (!usedDetKeys.has(k)) merged.push(d);
+    const k = `${Math.round(num(d.fromDepth, -1))}::${Math.round(
+      num(d.toDepth, -1)
+    )}::${String(d.curve || "")}`;
+    if (!usedKeys.has(k)) merged.push(d);
   }
 
-  return merged.slice(0, 12); // keep UI manageable
+  return merged.slice(0, 12);
 }
 
-/** Optional LLM polish for narrative */
 /** Optional LLM polish for narrative */
 async function maybeGroqNarrative({
   deterministic,
@@ -223,7 +240,6 @@ async function maybeGroqNarrative({
     ? deterministic.intervalFindings
     : [];
 
-  // No key => deterministic fallback
   if (!GROQ_API_KEY) {
     return {
       modelUsed: null,
@@ -328,7 +344,7 @@ Rules:
     const content = envelope?.choices?.[0]?.message?.content || "";
     const parsed = parseJsonFromModelContent(content);
 
-    // >>> HARD GUARD: never allow key intervals if deterministic has 0 events <<<
+    // hard guard
     const mergedIntervals =
       detIntervals.length === 0
         ? []
@@ -357,8 +373,22 @@ Rules:
   }
 }
 
-/** ---------- route ---------- **/
+/** ---------- routes ---------- **/
 
+// Optional DB ping route (enable only if needed)
+// router.get("/_db-check", async (_req, res) => {
+//   try {
+//     const r = await pgPool.query("SELECT NOW() as now");
+//     res.json({ ok: true, now: r.rows[0].now });
+//   } catch (e) {
+//     res.status(500).json({ ok: false, error: e.message });
+//   }
+// });
+
+/**
+ * POST /api/ai/interpret
+ * Runs deterministic + optional LLM narrative, persists run, returns live result.
+ */
 router.post("/interpret", async (req, res) => {
   try {
     const { wellId, fromDepth, toDepth, curves } = req.body || {};
@@ -381,7 +411,7 @@ router.post("/interpret", async (req, res) => {
     const hi = Math.max(Number(fromDepth), Number(toDepth));
     const metrics = curves.map(encodeURIComponent).join(",");
 
-    // 1) Try fast window endpoint first
+    // 1) try fast window endpoint
     let rowsPayload;
     try {
       rowsPayload = await safeJson(
@@ -390,7 +420,7 @@ router.post("/interpret", async (req, res) => {
         )}/window?metrics=${metrics}&from=${lo}&to=${hi}&px=4000`
       );
     } catch {
-      // 2) fallback to /data then filter
+      // 2) fallback: full data then filter
       const dataPayload = await safeJson(
         `${API_BASE}/api/well/${encodeURIComponent(wellId)}/data`
       );
@@ -410,7 +440,7 @@ router.post("/interpret", async (req, res) => {
         .json({ error: `Not enough rows in selected range. Got ${rows.length}` });
     }
 
-    // Call python deterministic service
+    // deterministic (python service)
     const ai = await callAiInterpret({
       wellId,
       fromDepth: lo,
@@ -419,13 +449,11 @@ router.post("/interpret", async (req, res) => {
       rows,
     });
 
-    // Supports both shapes:
-    // A) { deterministic: {...}, insight: {...} }
-    // B) { ...det fields... }
+    // supports both response shapes
     const deterministic = ai?.deterministic || ai || {};
     const insight = ai?.insight || null;
 
-    // Narrative (Groq optional)
+    // optional narrative via Groq
     const nar = await maybeGroqNarrative({
       deterministic,
       insight,
@@ -435,11 +463,28 @@ router.post("/interpret", async (req, res) => {
       wellId,
     });
 
+    // SINGLE INSERT (no duplicates)
+    const runRecord = await insertInterpretationRun({
+      wellId,
+      fromDepth: lo,
+      toDepth: hi,
+      curves,
+      deterministic,
+      insight,
+      narrative: nar.narrative,
+      modelUsed: nar.modelUsed,
+      narrativeStatus: nar.narrativeStatus,
+      source: "fresh",
+      appVersion: process.env.APP_VERSION || null,
+    });
+
     return res.json({
       ok: true,
       source: "fresh",
+      runId: runRecord?.runId ?? runRecord?.run_id ?? null,
+      createdAt: runRecord?.createdAt ?? runRecord?.created_at ?? new Date().toISOString(),
       well: { wellId, name: wellId },
-      range: { fromDepth: lo, toDepth: hi }, // source of truth for frontend
+      range: { fromDepth: lo, toDepth: hi },
       curves,
       deterministic,
       insight,
@@ -451,6 +496,61 @@ router.post("/interpret", async (req, res) => {
   } catch (err) {
     console.error("POST /api/ai/interpret failed:", err);
     return res.status(500).json({ error: err?.message || "Interpretation failed" });
+  }
+});
+
+/**
+ * GET /api/ai/runs
+ * History list (optional well filter)
+ */
+router.get("/runs", async (req, res) => {
+  try {
+    const wellId = req.query.wellId ? String(req.query.wellId) : undefined;
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(100, limitRaw))
+      : 20;
+
+    const runs = await listInterpretationRuns({ wellId, limit });
+    return res.json({ ok: true, runs });
+  } catch (err) {
+    console.error("GET /api/ai/runs failed:", err);
+    return res.status(500).json({ error: err?.message || "Failed to list runs" });
+  }
+});
+
+
+/**
+ * GET /api/ai/runs/:runId
+ * Replay one historical run
+ */
+router.get("/runs/:runId", async (req, res) => {
+  try {
+    const { runId } = req.params;
+    const row = await getInterpretationRunById(runId);
+
+    if (!row) return res.status(404).json({ error: "Run not found" });
+
+    // normalize snake_case or camelCase
+    const run = {
+      runId: row.runId ?? row.run_id,
+      wellId: row.wellId ?? row.well_id,
+      fromDepth: row.fromDepth ?? row.from_depth,
+      toDepth: row.toDepth ?? row.to_depth,
+      curves: row.curves ?? [],
+      deterministic: row.deterministic ?? null,
+      insight: row.insight ?? null,
+      narrative: row.narrative ?? null,
+      modelUsed: row.modelUsed ?? row.model_used ?? null,
+      narrativeStatus: row.narrativeStatus ?? row.narrative_status ?? null,
+      source: row.source ?? null,
+      createdAt: row.createdAt ?? row.created_at ?? null,
+    };
+
+    return res.json({ ok: true, run });
+  } catch (err) {
+    console.error("GET /api/ai/runs/:runId failed:", err);
+    return res.status(500).json({ error: err?.message || "Failed to fetch run" });
   }
 });
 
