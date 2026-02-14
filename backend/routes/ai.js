@@ -7,6 +7,8 @@ import {
 } from "../repositories/interpretationRunsRepo.js";
 // import { pgPool } from "../db/postgres.js"; // optional: only if you want /_db-check
 import { jsonrepair } from "jsonrepair";
+import PDFDocument from "pdfkit";
+
 
 
 const router = express.Router();
@@ -17,6 +19,132 @@ const GROQ_MODEL =
   process.env.GROQ_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
 
 /** ---------- helpers ---------- **/
+
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function fmt(v, d = 3) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(d) : "-";
+}
+function fmtInt(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Math.round(n)) : "-";
+}
+function safeArray(x) {
+  return Array.isArray(x) ? x : [];
+}
+function riskMeta(risk) {
+  const x = String(risk || "").toLowerCase();
+  if (x.includes("critical")) return { label: "CRITICAL", color: "#991b1b", bg: "#fef2f2", border: "#fecaca" };
+  if (x.includes("high")) return { label: "HIGH", color: "#9a3412", bg: "#fff7ed", border: "#fed7aa" };
+  if (x.includes("moderate") || x.includes("med")) return { label: "MODERATE", color: "#92400e", bg: "#fffbeb", border: "#fde68a" };
+  if (x.includes("low")) return { label: "LOW", color: "#065f46", bg: "#ecfdf5", border: "#a7f3d0" };
+  return { label: String(risk || "UNKNOWN").toUpperCase(), color: "#1f2937", bg: "#f9fafb", border: "#e5e7eb" };
+}
+function drawRoundedRect(doc, x, y, w, h, r = 6, fill = null, stroke = null) {
+  doc.save();
+  if (fill) doc.fillColor(fill);
+  if (stroke) doc.strokeColor(stroke);
+  doc.roundedRect(x, y, w, h, r);
+  if (fill && stroke) doc.fillAndStroke();
+  else if (fill) doc.fill();
+  else if (stroke) doc.stroke();
+  doc.restore();
+}
+function drawSectionTitle(doc, title) {
+  doc.moveDown(0.8);
+  doc.font("Helvetica-Bold").fontSize(13).fillColor("#111827").text(title);
+  doc.moveDown(0.25);
+}
+function ensureSpace(doc, needed = 80, top = 40, bottom = 45) {
+  const pageBottom = doc.page.height - bottom;
+  if (doc.y + needed > pageBottom) {
+    doc.addPage();
+    doc.y = top;
+  }
+}
+function drawPageFooter(doc) {
+  const oldBottom = doc.page.margins.bottom;
+  doc.page.margins.bottom = 0;
+  const y = doc.page.height - 24;
+  doc.fontSize(8).fillColor("#6b7280").text(`Page ${doc.page.number}`, 0, y, { align: "center" });
+  doc.page.margins.bottom = oldBottom;
+}
+
+function normalizeIntervals(narrativeIntervals, deterministicIntervals) {
+  const arr = safeArray(narrativeIntervals).length
+    ? safeArray(narrativeIntervals)
+    : safeArray(deterministicIntervals);
+
+  return arr.map((it, idx) => ({
+    idx: idx + 1,
+    curve: String(it?.curve || "-"),
+    fromDepth: toNum(it?.fromDepth),
+    toDepth: toNum(it?.toDepth),
+    priority: String(it?.priority || "-"),
+    probability: String(it?.probability || "-"),
+    stability: String(it?.stability || "-"),
+    stabilityScore: toNum(it?.stabilityScore),
+    confidence: toNum(it?.confidence),
+    reason: String(it?.reason || ""),
+    explanation: String(it?.explanation || ""),
+    agreement: toNum(it?.agreement),
+    width: toNum(it?.width),
+  }));
+}
+
+function consolidateIntervals(intervals, gapTolerance = 8) {
+  const valid = intervals
+    .filter((x) => Number.isFinite(x.fromDepth) && Number.isFinite(x.toDepth))
+    .map((x) => ({
+      ...x,
+      fromDepth: Math.min(x.fromDepth, x.toDepth),
+      toDepth: Math.max(x.fromDepth, x.toDepth),
+    }))
+    .sort((a, b) => a.fromDepth - b.fromDepth);
+
+  if (!valid.length) return [];
+
+  const groups = [];
+  let current = [valid[0]];
+  for (let i = 1; i < valid.length; i++) {
+    const prev = current[current.length - 1];
+    const next = valid[i];
+    if (next.fromDepth <= prev.toDepth + gapTolerance) current.push(next);
+    else {
+      groups.push(current);
+      current = [next];
+    }
+  }
+  groups.push(current);
+
+  return groups.map((g, idx) => {
+    const fromDepth = Math.min(...g.map((x) => x.fromDepth));
+    const toDepth = Math.max(...g.map((x) => x.toDepth));
+    const curves = [...new Set(g.map((x) => x.curve).filter(Boolean))];
+    const priorities = [...new Set(g.map((x) => x.priority).filter(Boolean))];
+    const probs = [...new Set(g.map((x) => x.probability).filter(Boolean))];
+    const stabilities = [...new Set(g.map((x) => x.stability).filter(Boolean))];
+    const confs = g.map((x) => x.confidence).filter(Number.isFinite);
+    const avgConfidence = confs.length ? confs.reduce((a, b) => a + b, 0) / confs.length : null;
+
+    return {
+      compositeId: idx + 1,
+      fromDepth,
+      toDepth,
+      width: toDepth - fromDepth,
+      intervalCount: g.length,
+      curves: curves.join(", "),
+      dominantPriority: priorities[0] || "-",
+      probabilityMix: probs.join(", ") || "-",
+      stabilityMix: stabilities.join(", ") || "-",
+      avgConfidence,
+    };
+  });
+}
+
 
 async function safeJson(url, opts = {}) {
   const res = await fetch(url, opts);
@@ -553,5 +681,256 @@ router.get("/runs/:runId", async (req, res) => {
     return res.status(500).json({ error: err?.message || "Failed to fetch run" });
   }
 });
+
+
+router.post("/interpret/export/pdf", async (req, res) => {
+  let doc = null;
+
+  try {
+    // Compute/validate first (before pipe)
+    const payload = req.body || {};
+    const wellId = String(payload?.well?.wellId || payload?.wellId || "-");
+    const range = payload?.range || {};
+    const fromDepth = toNum(range?.fromDepth ?? payload?.fromDepth);
+    const toDepth = toNum(range?.toDepth ?? payload?.toDepth);
+
+    const modelUsed = String(payload?.modelUsed || "-");
+    const narrativeStatus = String(payload?.narrativeStatus || "-");
+    const createdAtIso = payload?.createdAt || new Date().toISOString();
+    const exportedAtIso = new Date().toISOString();
+
+    const deterministic = payload?.deterministic || {};
+    const narrative = payload?.narrative || {};
+    const insight = payload?.insight || {};
+
+    const severityBand = deterministic?.severityBand || "UNKNOWN";
+    const rMeta = riskMeta(severityBand);
+
+    const intervals = normalizeIntervals(
+      narrative?.interval_explanations,
+      deterministic?.intervalFindings
+    );
+    const topIntervals = intervals.slice(0, 10);
+    const consolidated = consolidateIntervals(topIntervals, 8);
+
+    const recommendations = safeArray(narrative?.recommendations);
+    const limitations = safeArray(narrative?.limitations);
+
+    const filename = `interpretation_report_${wellId}_${Date.now()}.pdf`;
+
+    // Start streaming only after all above variables are ready
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    doc = new PDFDocument({
+      size: "A4",
+      margins: { top: 40, left: 40, right: 40, bottom: 45 },
+      bufferPages: true,
+      info: {
+        Title: `Interpretation Report - ${wellId}`,
+        Author: "AI Interpretation Service",
+        Subject: "Well Log Interpretation",
+      },
+    });
+
+    // stream safety
+    doc.on("error", (e) => {
+      console.error("PDFKit error:", e);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "PDF generation failed" });
+      } else {
+        try { res.end(); } catch {}
+      }
+    });
+
+    // if client disconnects early
+    res.on("close", () => {
+      if (doc && !doc.destroyed) {
+        try { doc.end(); } catch {}
+      }
+    });
+
+    doc.pipe(res);
+
+    // ===== Header =====
+    drawRoundedRect(doc, 40, 38, 515, 92, 8, "#f8fafc", "#e5e7eb");
+    doc.font("Helvetica-Bold").fontSize(18).fillColor("#111827")
+      .text("AI Interpretation Report", 54, 50);
+    doc.font("Helvetica").fontSize(10).fillColor("#374151")
+      .text("Automated well-log interpretation with deterministic + narrative analysis", 54, 74);
+
+    drawRoundedRect(doc, 425, 50, 112, 26, 12, rMeta.bg, rMeta.border);
+    doc.font("Helvetica-Bold").fontSize(10).fillColor(rMeta.color)
+      .text(`RISK: ${rMeta.label}`, 432, 58, { width: 98, align: "center" });
+
+    doc.y = 140;
+
+    // ===== Meta =====
+    drawRoundedRect(doc, 40, doc.y, 515, 78, 6, "#ffffff", "#e5e7eb");
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Well", 52, doc.y + 12);
+    doc.font("Helvetica").fontSize(10).fillColor("#111827").text(wellId, 160, doc.y + 11);
+
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Depth Range", 52, doc.y + 28);
+    doc.font("Helvetica").fontSize(10).fillColor("#111827")
+      .text(`${fmtInt(fromDepth)} → ${fmtInt(toDepth)} ft`, 160, doc.y + 27);
+
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Model", 52, doc.y + 44);
+    doc.font("Helvetica").fontSize(10).fillColor("#111827").text(modelUsed, 160, doc.y + 43);
+
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Narrative Status", 52, doc.y + 60);
+    doc.font("Helvetica").fontSize(10).fillColor("#111827").text(narrativeStatus, 160, doc.y + 59);
+
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Run Time", 322, doc.y + 12);
+    doc.font("Helvetica").fontSize(10).fillColor("#111827")
+      .text(new Date(createdAtIso).toLocaleString(), 395, doc.y + 11, { width: 150 });
+
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Export Time", 322, doc.y + 28);
+    doc.font("Helvetica").fontSize(10).fillColor("#111827")
+      .text(new Date(exportedAtIso).toLocaleString(), 395, doc.y + 27, { width: 150 });
+
+    doc.y += 88;
+
+    // ===== Executive Summary =====
+    drawSectionTitle(doc, "Executive Summary");
+    ensureSpace(doc, 90);
+
+    const cardsY = doc.y;
+    const gap = 10;
+    const cardW = (515 - gap * 4) / 5;
+    const cardH = 58;
+    const cards = [
+      { title: "Global Risk", value: rMeta.label, color: rMeta.color, bg: rMeta.bg, border: rMeta.border },
+      { title: "Events", value: String(deterministic?.eventCount ?? "-"), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
+      { title: "Detect Conf", value: fmt(deterministic?.detectionConfidence ?? deterministic?.confidence, 3), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
+      { title: "Severity Conf", value: fmt(deterministic?.severityConfidence, 3), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
+      { title: "Data Quality", value: String(deterministic?.dataQuality?.qualityBand || "-").toUpperCase(), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
+    ];
+
+    cards.forEach((c, i) => {
+      const x = 40 + i * (cardW + gap);
+      drawRoundedRect(doc, x, cardsY, cardW, cardH, 6, c.bg, c.border);
+      doc.font("Helvetica").fontSize(8).fillColor("#6b7280").text(c.title, x + 8, cardsY + 8, { width: cardW - 16 });
+      doc.font("Helvetica-Bold").fontSize(12).fillColor(c.color).text(c.value, x + 8, cardsY + 24, { width: cardW - 16, ellipsis: true });
+    });
+
+    doc.y = cardsY + cardH + 8;
+
+    if (insight?.summaryParagraph) {
+      ensureSpace(doc, 65);
+      drawRoundedRect(doc, 40, doc.y, 515, 54, 6, "#ffffff", "#e5e7eb");
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#111827").text("Interpretation Summary", 50, doc.y + 8);
+      doc.font("Helvetica").fontSize(9.5).fillColor("#374151")
+        .text(String(insight.summaryParagraph), 50, doc.y + 24, { width: 495, height: 24, ellipsis: true });
+      doc.y += 62;
+    }
+
+    // ===== Top Intervals (simple list/table-like) =====
+    drawSectionTitle(doc, "Top Intervals");
+    ensureSpace(doc, 70);
+
+    if (!topIntervals.length) {
+      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
+      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No key intervals detected for this run.", 52, doc.y + 11);
+      doc.y += 44;
+    } else {
+      topIntervals.forEach((it, i) => {
+        ensureSpace(doc, 26);
+        drawRoundedRect(doc, 40, doc.y, 515, 22, 4, i % 2 === 0 ? "#ffffff" : "#fafafa", "#eef2f7");
+        doc.font("Helvetica").fontSize(8.7).fillColor("#111827")
+          .text(
+            `${i + 1}. ${it.curve || "-"} | ${fmtInt(it.fromDepth)} → ${fmtInt(it.toDepth)} ft | Priority: ${it.priority || "-"} | Prob: ${it.probability || "-"} | Conf: ${fmt(it.confidence, 2)}`,
+            48,
+            doc.y + 7,
+            { width: 500, ellipsis: true }
+          );
+        doc.y += 24;
+      });
+      doc.y += 4;
+    }
+
+    // ===== Consolidated =====
+    drawSectionTitle(doc, "Consolidated Intervals (Composite)");
+    ensureSpace(doc, 60);
+
+    if (!consolidated.length) {
+      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
+      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No composite intervals available.", 52, doc.y + 11);
+      doc.y += 44;
+    } else {
+      consolidated.forEach((c, i) => {
+        ensureSpace(doc, 26);
+        drawRoundedRect(doc, 40, doc.y, 515, 22, 4, i % 2 === 0 ? "#ffffff" : "#f8fafc", "#e5e7eb");
+        doc.font("Helvetica").fontSize(8.7).fillColor("#111827")
+          .text(
+            `C${c.compositeId} | ${fmtInt(c.fromDepth)} → ${fmtInt(c.toDepth)} ft | N=${c.intervalCount} | Width=${fmt(c.width, 1)} | Priority=${c.dominantPriority} | AvgConf=${fmt(c.avgConfidence, 2)} | Curves=${c.curves || "-"}`,
+            48,
+            doc.y + 7,
+            { width: 500, ellipsis: true }
+          );
+        doc.y += 24;
+      });
+      doc.y += 4;
+    }
+
+    // ===== Recommendations =====
+    drawSectionTitle(doc, "Recommendations");
+    ensureSpace(doc, 45);
+    if (!recommendations.length) {
+      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
+      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No recommendations provided.", 52, doc.y + 11);
+      doc.y += 44;
+    } else {
+      const h = Math.max(38, recommendations.length * 16 + 16);
+      drawRoundedRect(doc, 40, doc.y, 515, h, 6, "#ffffff", "#e5e7eb");
+      let y = doc.y + 10;
+      doc.font("Helvetica").fontSize(10).fillColor("#111827");
+      recommendations.forEach((r, i) => {
+        doc.text(`${i + 1}. ${String(r)}`, 52, y, { width: 490 });
+        y += 16;
+      });
+      doc.y = y + 2;
+    }
+
+    // ===== Limitations =====
+    drawSectionTitle(doc, "Limitations");
+    ensureSpace(doc, 45);
+    if (!limitations.length) {
+      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
+      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No limitations provided.", 52, doc.y + 11);
+      doc.y += 44;
+    } else {
+      const h = Math.max(38, limitations.length * 16 + 16);
+      drawRoundedRect(doc, 40, doc.y, 515, h, 6, "#ffffff", "#e5e7eb");
+      let y = doc.y + 10;
+      doc.font("Helvetica").fontSize(10).fillColor("#111827");
+      limitations.forEach((l, i) => {
+        doc.text(`${i + 1}. ${String(l)}`, 52, y, { width: 490 });
+        y += 16;
+      });
+      doc.y = y + 2;
+    }
+
+    // Footers all pages
+    const pageCount = doc.bufferedPageRange().count;
+    for (let i = 0; i < pageCount; i++) {
+      doc.switchToPage(i);
+      drawPageFooter(doc);
+    }
+
+    doc.end();
+  } catch (err) {
+    console.error("POST /api/ai/interpret/export/pdf failed:", err);
+
+    // DO NOT write JSON if stream already started
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err?.message || "PDF export failed" });
+    }
+
+    // If already streaming, just end safely
+    try { res.end(); } catch {}
+  }
+});
+
+
 
 export default router;
