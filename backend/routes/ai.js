@@ -1,17 +1,37 @@
 import express from "express";
 import { callAiInterpret } from "../services/aiClient.js";
+import { pgPool } from "../db/postgres.js";
+
 import {
   insertInterpretationRun,
   getInterpretationRunById,
   listInterpretationRuns,
 } from "../repositories/interpretationRunsRepo.js";
-// import { pgPool } from "../db/postgres.js"; // optional: only if you want /_db-check
 import { jsonrepair } from "jsonrepair";
 import PDFDocument from "pdfkit";
+import {
+  insertCopilotRun,
+  listCopilotRuns,
+  getCopilotRunById,
+} from "../repositories/copilotRunsRepo.js";
+import { callPythonCopilot } from "../services/pyCopilotClient.js";
 
-
+import {
+  buildPlaybookSnippets,
+  evidenceSufficiency,
+  computeCompareMetrics,
+  buildFallbackJson
+} from "../services/copilotEngine.js";
+import { validateCopilotResponse } from "../services/copilotSchema.js";
 
 const router = express.Router();
+
+
+
+// Add these envs
+const PY_AI_BASE = process.env.PY_AI_BASE || "http://127.0.0.1:8000";
+const PY_COPILOT_TIMEOUT_MS = Number(process.env.PY_COPILOT_TIMEOUT_MS || 45000);
+
 
 const API_BASE = process.env.API_BASE || "http://localhost:5000";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
@@ -20,21 +40,78 @@ const GROQ_MODEL =
 
 /** ---------- helpers ---------- **/
 
-function toNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+
+
+
+
+function fmt(v, digits = 1, fallback = "n/a") {
+  const n = safeNum(v, null);
+  if (n === null) return fallback;
+  return n.toFixed(safeDigits(digits, 1));
 }
-function fmt(v, d = 3) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n.toFixed(d) : "-";
+
+
+
+
+
+
+
+
+function normalizeRange(fromDepth, toDepth) {
+  const a = Number(fromDepth);
+  const b = Number(toDepth);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return { fromDepth: Math.min(a, b), toDepth: Math.max(a, b) };
 }
-function fmtInt(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? String(Math.round(n)) : "-";
+
+function timeoutMsFromEnv(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
-function safeArray(x) {
-  return Array.isArray(x) ? x : [];
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 45000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    const txt = await res.text();
+    let json = null;
+    try { json = JSON.parse(txt); } catch {}
+    return { ok: res.ok, status: res.status, json, text: txt };
+  } finally {
+    clearTimeout(t);
+  }
 }
+
+
+
+async function computeDeterministicForRange({ wellId, range, curves }) {
+  if (!wellId || !range) return null;
+  const rows = await fetchRowsForRange({
+    wellId,
+    fromDepth: range.fromDepth,
+    toDepth: range.toDepth,
+    curves,
+  });
+
+  if (!Array.isArray(rows) || rows.length < 20) {
+    return null; // insufficient baseline rows
+  }
+
+  const ai = await callAiInterpret({
+    wellId,
+    fromDepth: range.fromDepth,
+    toDepth: range.toDepth,
+    curves,
+    rows,
+  });
+
+  return ai?.deterministic || ai || null;
+}
+
+
+
+
 function riskMeta(risk) {
   const x = String(risk || "").toLowerCase();
   if (x.includes("critical")) return { label: "CRITICAL", color: "#991b1b", bg: "#fef2f2", border: "#fecaca" };
@@ -145,7 +222,6 @@ function consolidateIntervals(intervals, gapTolerance = 8) {
   });
 }
 
-
 async function safeJson(url, opts = {}) {
   const res = await fetch(url, opts);
   const text = await res.text();
@@ -212,48 +288,342 @@ function fallbackNarrativeFromDeterministic(deterministic) {
 function parseJsonFromModelContent(content) {
   const candidates = [];
 
-  // A) raw content
-  if (typeof content === "string" && content.trim()) {
-    candidates.push(content.trim());
-  }
+  if (typeof content === "string" && content.trim()) candidates.push(content.trim());
 
-  // B) fenced block
   const fenceMatch = content?.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch?.[1]) {
-    candidates.push(fenceMatch[1].trim());
-  }
+  if (fenceMatch?.[1]) candidates.push(fenceMatch[1].trim());
 
-  // C) largest {...} slice
   const start = content?.indexOf("{");
   const end = content?.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    candidates.push(content.slice(start, end + 1).trim());
-  }
+  if (start >= 0 && end > start) candidates.push(content.slice(start, end + 1).trim());
 
   for (const raw of candidates) {
-    // 1) strict parse
     try {
       return JSON.parse(raw);
-    } catch {
-      // continue
-    }
-
-    // 2) repair then parse
+    } catch {}
     try {
       const repaired = jsonrepair(raw);
       return JSON.parse(repaired);
-    } catch {
-      // continue
-    }
+    } catch {}
   }
 
   throw new Error("Model content is not valid/repairable JSON");
 }
 
+// --- COPILOT HELPERS ---
 
-function num(x, def = NaN) {
-  const v = Number(x);
-  return Number.isFinite(v) ? v : def;
+function num(v, d = 2) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Number(n.toFixed(d)) : null;
+}
+
+function asText(x, fallback = "") {
+  if (x === null || x === undefined) return fallback;
+  const s = String(x).trim();
+  return s || fallback;
+}
+function clamp01(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return Number(n.toFixed(3));
+}
+function confidenceRubric(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "unknown";
+  if (n >= 0.75) return "high";
+  if (n >= 0.45) return "medium";
+  return "low";
+}
+
+function buildEvidenceBlock({
+  mode,
+  question,
+  wellId,
+  fromDepth,
+  toDepth,
+  selectedInterval,
+  deterministic,
+  insight,
+  narrative,
+  curves,
+  historyRuns = [],
+  playbook = [],
+}) {
+  return {
+    objective: {
+      mode: asText(mode, "data_qa"),
+      question: asText(question, "No question provided"),
+    },
+    context_meta: {
+      wellId: asText(wellId, "-"),
+      range: {
+        fromDepth: Number.isFinite(Number(fromDepth)) ? Number(fromDepth) : null,
+        toDepth: Number.isFinite(Number(toDepth)) ? Number(toDepth) : null,
+      },
+      selectedInterval:
+        selectedInterval &&
+        Number.isFinite(Number(selectedInterval.fromDepth)) &&
+        Number.isFinite(Number(selectedInterval.toDepth))
+          ? {
+              fromDepth: Number(selectedInterval.fromDepth),
+              toDepth: Number(selectedInterval.toDepth),
+            }
+          : null,
+      curves: toArr(curves).map(String),
+      generatedAt: new Date().toISOString(),
+    },
+    deterministic: deterministic && typeof deterministic === "object" ? deterministic : {},
+    insight: insight && typeof insight === "object" ? insight : {},
+    narrative: narrative && typeof narrative === "object" ? narrative : {},
+    recent_history: toArr(historyRuns).slice(0, 5),
+    playbook_snippets: toArr(playbook).slice(0, 8),
+  };
+}
+
+// Extract likely interval explanations from narrative + insight
+function extractIntervals(evidence) {
+  const narIntervals = toArr(evidence?.narrative?.interval_explanations).map((it) => ({
+    fromDepth: Number(it?.fromDepth),
+    toDepth: Number(it?.toDepth),
+    curve: asText(it?.curve, ""),
+    probability: asText(it?.probability, ""),
+    stability: asText(it?.stability, ""),
+    confidence: num(it?.confidence, 3),
+    explanation: asText(it?.explanation, ""),
+    priority: asText(it?.priority, ""),
+  }));
+
+  const shows = toArr(evidence?.insight?.shows).map((s) => ({
+    fromDepth: Number(s?.fromDepth),
+    toDepth: Number(s?.toDepth),
+    curve: "shows",
+    probability: asText(s?.probability, ""),
+    stability: asText(s?.stability, ""),
+    confidence: num(s?.stabilityScore, 3),
+    explanation: asText(s?.reason, ""),
+    priority: "",
+  }));
+
+  return [...narIntervals, ...shows].filter(
+    (x) => Number.isFinite(x.fromDepth) && Number.isFinite(x.toDepth)
+  );
+}
+
+function intervalOverlapScore(aFrom, aTo, bFrom, bTo) {
+  const lo = Math.max(aFrom, bFrom);
+  const hi = Math.min(aTo, bTo);
+  const inter = Math.max(0, hi - lo);
+  const span = Math.max(1e-9, Math.max(aTo, bTo) - Math.min(aFrom, bFrom));
+  return inter / span;
+}
+
+function buildFallbackAnswer(evidence) {
+  const mode = evidence?.objective?.mode || "data_qa";
+  const wellId = evidence?.context_meta?.wellId || "-";
+  const range = evidence?.context_meta?.range || {};
+  const det = evidence?.deterministic || {};
+  const nar = evidence?.narrative || {};
+  const insight = evidence?.insight || {};
+
+  const intervals = extractIntervals(evidence);
+  const sel = evidence?.context_meta?.selectedInterval;
+
+  let topInterval = intervals[0] || null;
+  if (sel && intervals.length) {
+    let best = null;
+    let bestScore = -1;
+    for (const it of intervals) {
+      const s = intervalOverlapScore(
+        Number(sel.fromDepth),
+        Number(sel.toDepth),
+        Number(it.fromDepth),
+        Number(it.toDepth)
+      );
+      if (s > bestScore) {
+        bestScore = s;
+        best = it;
+      }
+    }
+    topInterval = best || topInterval;
+  }
+
+  const eventCount = Number(det?.eventCount);
+  const sev = asText(det?.severityBand, "unknown");
+  const dq = asText(det?.dataQuality?.qualityBand, "unknown");
+  const limitations = toArr(nar?.limitations);
+
+  let direct = "";
+  let actions = [];
+  let comparison = { summary: "", delta_metrics: [] };
+
+  if (mode === "data_qa") {
+    direct = topInterval
+      ? `The data suggests this interval was flagged due to pattern anomalies in selected curves with supporting deterministic evidence (severity: ${sev}, data quality: ${dq}). The most relevant interval is ${topInterval.fromDepth}–${topInterval.toDepth} ft${topInterval.explanation ? `: ${topInterval.explanation}` : ""}.`
+      : `The current analyzed range ${range.fromDepth ?? "-"}–${range.toDepth ?? "-"} ft shows a ${sev} risk signal with ${dq} data quality. No specific interval explanation was found in narrative blocks, so the answer is based on aggregate deterministic indicators.`;
+    actions = [
+      {
+        priority: "medium",
+        action: "Re-run interpretation on a narrower interval around flagged zone",
+        rationale: "Improves localization and explanation quality for root-cause review.",
+      },
+    ];
+  } else if (mode === "ops") {
+    direct = `For operations, prioritize verification steps around highest-risk indications (severity: ${sev}) and confirm measurement reliability (data quality: ${dq}).`;
+    actions = [
+      {
+        priority: "high",
+        action: "Validate sensor/calibration and null/missing segments first",
+        rationale: "Data-quality defects can produce false flags or distort severity.",
+      },
+      {
+        priority: "medium",
+        action: "Inspect drilling parameters near flagged depth windows",
+        rationale: "Cross-check whether operational changes coincide with anomaly windows.",
+      },
+      {
+        priority: "medium",
+        action: "Review gas-show and stability indicators before next decision point",
+        rationale: "Combining deterministic + show/stability context reduces blind spots.",
+      },
+    ];
+  } else {
+    const f = Number(range?.fromDepth);
+    const t = Number(range?.toDepth);
+    const prevFrom = Number.isFinite(f) ? Math.max(0, f - 500) : null;
+    const prevTo = Number.isFinite(f) ? f : null;
+
+    comparison = {
+      summary:
+        Number.isFinite(prevFrom) && Number.isFinite(prevTo)
+          ? `Compared current interval ${f}–${t} ft against previous window ${prevFrom}–${prevTo} ft using available deterministic/narrative evidence.`
+          : `Comparison baseline window could not be derived from current range.`,
+      delta_metrics: [
+        { metric: "Event Count", current: eventCount || 0, baseline: "n/a", delta: "n/a" },
+        { metric: "Severity Band", current: sev, baseline: "n/a", delta: "qualitative" },
+        { metric: "Data Quality Band", current: dq, baseline: "n/a", delta: "qualitative" },
+      ],
+    };
+
+    direct = `Comparison indicates current interval carries a ${sev} signal. Quantitative baseline metrics were limited by available history payload, so this is a qualitative compare result.`;
+    actions = [
+      {
+        priority: "medium",
+        action: "Store baseline summary per 500 ft window for future quantitative compare",
+        rationale: "Enables true delta computation (counts, confidence, densities).",
+      },
+    ];
+  }
+
+  const confOverall = clamp01(
+    0.35 +
+      (Number.isFinite(eventCount) ? Math.min(0.25, eventCount * 0.02) : 0) +
+      (sev.toLowerCase().includes("high") || sev.toLowerCase().includes("critical") ? 0.15 : 0) +
+      (dq.toLowerCase().includes("low") ? -0.1 : 0.05)
+  );
+
+  return {
+    answer_title:
+      mode === "ops"
+        ? "Operational Recommendation"
+        : mode === "compare"
+        ? "Interval Comparison"
+        : "Copilot Answer",
+    direct_answer: direct,
+    key_points: [
+      `Well: ${wellId}`,
+      `Analyzed range: ${range?.fromDepth ?? "-"}–${range?.toDepth ?? "-"} ft`,
+      `Severity band: ${sev}`,
+      `Data quality: ${dq}`,
+      ...(topInterval ? [`Top explained interval: ${topInterval.fromDepth}–${topInterval.toDepth} ft`] : []),
+    ],
+    actions,
+    comparison,
+    risks: [
+      ...(sev.toLowerCase().includes("high") || sev.toLowerCase().includes("critical")
+        ? ["Elevated anomaly severity in current evidence window."]
+        : []),
+      ...(asText(insight?.riskProfile?.summary) ? [asText(insight?.riskProfile?.summary)] : []),
+    ].filter(Boolean),
+    uncertainties: [
+      ...(limitations.length ? limitations : ["Limited baseline history for quantitative comparison."]),
+    ],
+    confidence: {
+      overall: confOverall,
+      rubric: confidenceRubric(confOverall),
+      reason:
+        "Confidence is derived from evidence availability (deterministic indicators, interval explanations, and data-quality context).",
+    },
+    evidence_used: [
+      {
+        source: "deterministic",
+        confidence: "high",
+        snippet: `severity=${sev}, dataQuality=${dq}, eventCount=${Number.isFinite(eventCount) ? eventCount : "n/a"}`,
+      },
+      {
+        source: "narrative",
+        confidence: topInterval ? "medium" : "low",
+        snippet: topInterval?.explanation || "No detailed interval explanation available.",
+      },
+    ],
+    safety_note: "Decision support only, not autonomous control.",
+  };
+}
+
+function normalizeCopilotOutput(raw, evidence) {
+  const candidate = raw?.json || raw?.result || raw?.answer || raw || {};
+  const fb = buildFallbackAnswer(evidence);
+
+  const merged = {
+    ...fb,
+    ...(candidate && typeof candidate === "object" ? candidate : {}),
+  };
+
+  merged.answer_title = asText(merged.answer_title, fb.answer_title);
+  merged.direct_answer = asText(merged.direct_answer, fb.direct_answer);
+  merged.key_points = toArr(merged.key_points).map((x) => asText(x)).filter(Boolean);
+  merged.actions = toArr(merged.actions)
+    .map((a) => ({
+      priority: asText(a?.priority, "medium").toLowerCase(),
+      action: asText(a?.action, ""),
+      rationale: asText(a?.rationale, ""),
+    }))
+    .filter((a) => a.action);
+
+  merged.comparison =
+    merged.comparison && typeof merged.comparison === "object"
+      ? {
+          summary: asText(merged.comparison.summary, ""),
+          delta_metrics: toArr(merged.comparison.delta_metrics).map((d) => ({
+            metric: asText(d?.metric, ""),
+            current: d?.current ?? "n/a",
+            baseline: d?.baseline ?? "n/a",
+            delta: d?.delta ?? "n/a",
+          })),
+        }
+      : fb.comparison;
+
+  merged.risks = toArr(merged.risks).map((x) => asText(x)).filter(Boolean);
+  merged.uncertainties = toArr(merged.uncertainties).map((x) => asText(x)).filter(Boolean);
+  merged.evidence_used = toArr(merged.evidence_used)
+    .map((e) => ({
+      source: asText(e?.source, "unknown"),
+      confidence: asText(e?.confidence, "medium").toLowerCase(),
+      snippet: asText(e?.snippet, ""),
+    }))
+    .filter((e) => e.snippet);
+
+  const conf = merged.confidence && typeof merged.confidence === "object" ? merged.confidence : {};
+  const overall = clamp01(conf.overall ?? fb.confidence.overall);
+  merged.confidence = {
+    overall,
+    rubric: asText(conf.rubric, confidenceRubric(overall)),
+    reason: asText(conf.reason, fb.confidence.reason),
+  };
+
+  merged.safety_note = "Decision support only, not autonomous control.";
+  return merged;
 }
 
 /** Similarity score for interval matching (LLM interval -> deterministic interval) */
@@ -275,11 +645,9 @@ function intervalSimilarity(a, b) {
   const midDist = Math.abs(midA - midB);
   const widthDist = Math.abs(widthA - widthB);
 
-  // smaller distance is better; add curve-match bonus
   let score = -midDist - 0.35 * widthDist;
   if (aCurve && bCurve && aCurve === bCurve) score += 12;
-  if (aCurve && bCurve && (aCurve.includes(bCurve) || bCurve.includes(aCurve)))
-    score += 6;
+  if (aCurve && bCurve && (aCurve.includes(bCurve) || bCurve.includes(aCurve))) score += 6;
 
   return score;
 }
@@ -323,7 +691,6 @@ function mergeNarrativeIntervals(llmIntervals, deterministic) {
         "Anomalous behavior observed; validate with adjacent data.",
       confidence: it?.confidence ?? d?.confidence ?? null,
       priority: it?.priority ?? d?.priority ?? "watch",
-
       probability: it?.probability ?? d?.probability ?? null,
       stability: it?.stability ?? d?.stability ?? null,
       stabilityScore: it?.stabilityScore ?? d?.stabilityScore ?? null,
@@ -335,7 +702,6 @@ function mergeNarrativeIntervals(llmIntervals, deterministic) {
     };
   });
 
-  // append deterministic intervals not represented by merged LLM intervals
   const usedKeys = new Set(
     merged.map(
       (m) =>
@@ -472,7 +838,6 @@ Rules:
     const content = envelope?.choices?.[0]?.message?.content || "";
     const parsed = parseJsonFromModelContent(content);
 
-    // hard guard
     const mergedIntervals =
       detIntervals.length === 0
         ? []
@@ -501,22 +866,69 @@ Rules:
   }
 }
 
+
+
+
+
+/** ---------- shared data fetch for ranges ---------- **/
+async function fetchRowsForRange({ wellId, fromDepth, toDepth, curves }) {
+  const lo = Math.min(Number(fromDepth), Number(toDepth));
+  const hi = Math.max(Number(fromDepth), Number(toDepth));
+  const metrics = (Array.isArray(curves) ? curves : []).map(encodeURIComponent).join(",");
+
+  let rowsPayload;
+  try {
+    rowsPayload = await safeJson(
+      `${API_BASE}/api/well/${encodeURIComponent(
+        wellId
+      )}/window?metrics=${metrics}&from=${lo}&to=${hi}&px=4000`
+    );
+  } catch {
+    const dataPayload = await safeJson(
+      `${API_BASE}/api/well/${encodeURIComponent(wellId)}/data`
+    );
+    const allRows = Array.isArray(dataPayload?.rows) ? dataPayload.rows : [];
+    rowsPayload = {
+      rows: allRows.filter((r) => {
+        const d = Number(r?.depth);
+        return Number.isFinite(d) && d >= lo && d <= hi;
+      }),
+    };
+  }
+
+  const rows = Array.isArray(rowsPayload?.rows) ? rowsPayload.rows : [];
+  return { rows, lo, hi };
+}
+
+async function runDeterministicOnly({ wellId, fromDepth, toDepth, curves }) {
+  const { rows, lo, hi } = await fetchRowsForRange({ wellId, fromDepth, toDepth, curves });
+  if (!rows.length || rows.length < 20) {
+    return {
+      ok: false,
+      deterministic: {},
+      reason: `Not enough rows in selected range. Got ${rows.length}`,
+      range: { fromDepth: lo, toDepth: hi },
+    };
+  }
+
+  const ai = await callAiInterpret({
+    wellId,
+    fromDepth: lo,
+    toDepth: hi,
+    curves,
+    rows,
+  });
+
+  return {
+    ok: true,
+    deterministic: ai?.deterministic || ai || {},
+    insight: ai?.insight || {},
+    range: { fromDepth: lo, toDepth: hi },
+  };
+}
+
 /** ---------- routes ---------- **/
 
-// Optional DB ping route (enable only if needed)
-// router.get("/_db-check", async (_req, res) => {
-//   try {
-//     const r = await pgPool.query("SELECT NOW() as now");
-//     res.json({ ok: true, now: r.rows[0].now });
-//   } catch (e) {
-//     res.status(500).json({ ok: false, error: e.message });
-//   }
-// });
-
-/**
- * POST /api/ai/interpret
- * Runs deterministic + optional LLM narrative, persists run, returns live result.
- */
 router.post("/interpret", async (req, res) => {
   try {
     const { wellId, fromDepth, toDepth, curves } = req.body || {};
@@ -524,51 +936,28 @@ router.post("/interpret", async (req, res) => {
     if (!wellId) {
       return res.status(400).json({ error: "wellId is required" });
     }
-
     if (!Array.isArray(curves) || curves.length === 0) {
       return res.status(400).json({ error: "curves must be a non-empty array" });
     }
-
     if (!Number.isFinite(Number(fromDepth)) || !Number.isFinite(Number(toDepth))) {
       return res
         .status(400)
         .json({ error: "fromDepth/toDepth must be valid numbers" });
     }
 
-    const lo = Math.min(Number(fromDepth), Number(toDepth));
-    const hi = Math.max(Number(fromDepth), Number(toDepth));
-    const metrics = curves.map(encodeURIComponent).join(",");
+    const { rows, lo, hi } = await fetchRowsForRange({
+      wellId,
+      fromDepth,
+      toDepth,
+      curves,
+    });
 
-    // 1) try fast window endpoint
-    let rowsPayload;
-    try {
-      rowsPayload = await safeJson(
-        `${API_BASE}/api/well/${encodeURIComponent(
-          wellId
-        )}/window?metrics=${metrics}&from=${lo}&to=${hi}&px=4000`
-      );
-    } catch {
-      // 2) fallback: full data then filter
-      const dataPayload = await safeJson(
-        `${API_BASE}/api/well/${encodeURIComponent(wellId)}/data`
-      );
-      const allRows = Array.isArray(dataPayload?.rows) ? dataPayload.rows : [];
-      rowsPayload = {
-        rows: allRows.filter((r) => {
-          const d = Number(r?.depth);
-          return Number.isFinite(d) && d >= lo && d <= hi;
-        }),
-      };
-    }
-
-    const rows = Array.isArray(rowsPayload?.rows) ? rowsPayload.rows : [];
     if (rows.length < 20) {
       return res
         .status(400)
         .json({ error: `Not enough rows in selected range. Got ${rows.length}` });
     }
 
-    // deterministic (python service)
     const ai = await callAiInterpret({
       wellId,
       fromDepth: lo,
@@ -577,11 +966,9 @@ router.post("/interpret", async (req, res) => {
       rows,
     });
 
-    // supports both response shapes
     const deterministic = ai?.deterministic || ai || {};
     const insight = ai?.insight || null;
 
-    // optional narrative via Groq
     const nar = await maybeGroqNarrative({
       deterministic,
       insight,
@@ -591,7 +978,6 @@ router.post("/interpret", async (req, res) => {
       wellId,
     });
 
-    // SINGLE INSERT (no duplicates)
     const runRecord = await insertInterpretationRun({
       wellId,
       fromDepth: lo,
@@ -627,10 +1013,6 @@ router.post("/interpret", async (req, res) => {
   }
 });
 
-/**
- * GET /api/ai/runs
- * History list (optional well filter)
- */
 router.get("/runs", async (req, res) => {
   try {
     const wellId = req.query.wellId ? String(req.query.wellId) : undefined;
@@ -647,11 +1029,6 @@ router.get("/runs", async (req, res) => {
   }
 });
 
-
-/**
- * GET /api/ai/runs/:runId
- * Replay one historical run
- */
 router.get("/runs/:runId", async (req, res) => {
   try {
     const { runId } = req.params;
@@ -659,7 +1036,6 @@ router.get("/runs/:runId", async (req, res) => {
 
     if (!row) return res.status(404).json({ error: "Run not found" });
 
-    // normalize snake_case or camelCase
     const run = {
       runId: row.runId ?? row.run_id,
       wellId: row.wellId ?? row.well_id,
@@ -682,12 +1058,697 @@ router.get("/runs/:runId", async (req, res) => {
   }
 });
 
+// POST /api/ai/copilot/query
+// ai.js (only the /copilot/query route + helper)
+// Drop this in your router file and replace your existing /copilot/query route.
+// Make sure callPythonCopilot, buildPlaybookSnippets, evidenceSufficiency,
+// computeCompareMetrics, buildFallbackJson, validateCopilotResponse are imported.
+
+
+
+
+function normalizeSource(pyResp, hasLlmJson) {
+  if (!hasLlmJson) return "fallback";
+  const src = String(pyResp?.source || "").trim().toLowerCase();
+  if (src === "llm" || src === "python" || src === "fallback") return src;
+  if (pyResp?.used_llm === true) return "llm";
+  return "python";
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// POST /api/ai/copilot/query
+// ---------- copilot helpers (keep near /copilot/query) ----------
+function isObj(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+function toArr(x) {
+  return Array.isArray(x) ? x : [];
+}
+function asStr(x, d = "") {
+  if (x === null || x === undefined) return d;
+  const s = String(x).trim();
+  return s || d;
+}
+function safeNum(v, d = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+function safeDigits(d, def = 1) {
+  const n = Number(d);
+  if (!Number.isFinite(n)) return def;
+  const i = Math.trunc(n);
+  if (i < 0) return 0;
+  if (i > 100) return 100;
+  return i;
+}
+function fmtNum(v, digits = 1, fallback = "n/a") {
+  const n = safeNum(v, null);
+  if (n === null) return fallback;
+  return n.toFixed(safeDigits(digits, 1));
+}
+
+
+
+
+
+
+function resolveSource(pyResp, llmJson) {
+  if (!llmJson) return "fallback";
+  const pySource = asStr(pyResp?.source, "").toLowerCase();
+  const llmUsed = pyResp?.llm_used === true || pyResp?.meta?.llm_used === true;
+  if (llmUsed) return "llm";
+  if (["llm", "python"].includes(pySource)) return "llm";
+  if (pySource === "grounded_guard") return "grounded_guard";
+  if (pySource === "fallback" || pySource === "python_fallback") return "fallback";
+  return "llm";
+}
+
+
+
+
+
+// ---------- /copilot/query ----------
+router.post("/copilot/query", async (req, res) => {
+  const startedAt = Date.now();
+
+  let mode = "data_qa";
+  let question = "What does this data say?";
+  let wellId = "";
+  let fromDepth = null;
+  let toDepth = null;
+
+  try {
+    const body = req.body || {};
+    mode = safeStr(body.mode, "data_qa");
+    question = safeStr(body.question, "What does this data say?");
+    wellId = safeStr(body.wellId, "");
+    fromDepth = toNum(body.fromDepth);
+    toDepth = toNum(body.toDepth);
+    const curves = safeArr(body.curves).map((x) => String(x));
+
+    const evidence = {
+      objective: { mode, question },
+      context_meta: {
+        wellId: wellId || "UNKNOWN_WELL",
+        range: { fromDepth, toDepth },
+        selectedInterval: body.selectedInterval || null,
+        curves,
+        generatedAt: new Date().toISOString(),
+      },
+      deterministic: isObject(body.deterministic) ? body.deterministic : {},
+      insight: isObject(body.insight) ? body.insight : {},
+      narrative: isObject(body.narrative) ? body.narrative : {},
+      recent_history: safeArr(body.recent_history).slice(0, 5),
+      playbook_snippets: buildPlaybookSnippets(mode),
+    };
+
+    // Evidence gate - allow depth query with deterministic even if narrative is thin
+    const gate = evidenceSufficiency(evidence);
+    const depthQ = isDepthQuery(question);
+    const detExists = isObject(evidence.deterministic) && Object.keys(evidence.deterministic).length > 0;
+    const bypassGate = depthQ && detExists;
+
+    if (!gate.ok && !bypassGate) {
+      const fallback = buildFallbackJson({ mode, evidence, compare: { summary: "", delta_metrics: [] } });
+      const patched = patchDirectAnswerFromEvidence(fallback, evidence, question);
+      const latencyMs = Date.now() - startedAt;
+
+      const responsePayload = {
+        ok: true,
+        source: "fallback",
+        schema_valid: true,
+        evidence_strength: "low",
+        json: patched,
+        evidence,
+        llm_error: `evidence_gate_failed:${safeArr(gate.missing).join(",")}`,
+        latency_ms: latencyMs,
+      };
+
+      try {
+        await insertCopilotRunRow({
+          source: "fallback",
+          llmUsed: false,
+          schemaValid: true,
+          modelName: null,
+          latencyMs,
+          llmError: responsePayload.llm_error,
+          question,
+          mode,
+          wellId: evidence.context_meta.wellId,
+          fromDepth,
+          toDepth,
+          curves,
+          responseJson: patched,
+          evidenceJson: evidence,
+          schemaErrors: [],
+        });
+      } catch (dbErr) {
+        console.warn("[copilot] DB insert failed:", dbErr?.message || dbErr);
+      }
+
+      return res.json(responsePayload);
+    }
+
+    // Compare mode metrics
+    let compare = { summary: "", delta_metrics: [] };
+    if (mode === "compare") {
+      const baseline = body.baseline || {
+        range: {
+          fromDepth: Number(fromDepth) - 500,
+          toDepth: Number(fromDepth),
+        },
+        deterministic: body.baselineDeterministic || {},
+      };
+      const current = {
+        range: { fromDepth, toDepth },
+        deterministic: body.deterministic || {},
+      };
+      compare = computeCompareMetrics({ current, baseline });
+    }
+
+    let pyResp = null;
+    let llmError = null;
+    let llmCandidate = null;
+
+    try {
+      pyResp = await callPythonCopilot({
+        mode,
+        question,
+        wellId: evidence.context_meta.wellId,
+        fromDepth,
+        toDepth,
+        selectedInterval: body.selectedInterval || null,
+        curves,
+        evidence,
+        compare,
+      });
+
+      const ext = extractCandidateFromPython(pyResp);
+      llmCandidate = ext.candidate;
+      if (!llmCandidate && ext.reason) llmError = ext.reason;
+    } catch (err) {
+      llmError = err?.message || "python_call_failed";
+      console.warn("[copilot] python call failed:", llmError);
+    }
+
+    // choose candidate first, then patch, then validate
+    const baseCandidate = llmCandidate || buildFallbackJson({ mode, evidence, compare });
+
+    let finalJson = patchDirectAnswerFromEvidence(baseCandidate, evidence, question);
+
+    const validation = validateCopilotResponse(finalJson);
+    let schemaValid = !!validation.ok;
+    let schemaErrors = schemaValid ? [] : validation.errors || [];
+    let sourceValue = inferSource(pyResp, !!llmCandidate);
+
+    if (!schemaValid) {
+      finalJson = patchDirectAnswerFromEvidence(
+        buildFallbackJson({ mode, evidence, compare }),
+        evidence,
+        question
+      );
+      sourceValue = "fallback";
+      if (!llmError) llmError = "llm_schema_invalid";
+      schemaValid = true; // because fallback is expected valid in your builder
+      schemaErrors = [];
+    }
+
+    const latencyMs = Date.now() - startedAt;
+    const modelName =
+      safeStr(pyResp?.llm_model, "") ||
+      safeStr(pyResp?.model, "") ||
+      safeStr(pyResp?.model_name, "") ||
+      process.env.LLM_PRIMARY ||
+      process.env.GROQ_MODEL ||
+      null;
+
+    const responsePayload = {
+      ok: true,
+      source: sourceValue,
+      schema_valid: schemaValid,
+      schema_errors: schemaErrors,
+      evidence_strength: gate.ok || bypassGate ? "medium" : "low",
+      json: finalJson,
+      evidence,
+      llm_error: llmError,
+      latency_ms: latencyMs,
+    };
+
+    try {
+      await insertCopilotRunRow({
+        source: sourceValue,
+        llmUsed: sourceValue !== "fallback",
+        schemaValid,
+        modelName,
+        latencyMs,
+        llmError,
+        question,
+        mode,
+        wellId: evidence.context_meta.wellId,
+        fromDepth,
+        toDepth,
+        curves,
+        responseJson: finalJson,
+        evidenceJson: evidence,
+        schemaErrors,
+      });
+    } catch (dbErr) {
+      console.warn("[copilot] DB insert failed:", dbErr?.message || dbErr);
+    }
+
+    return res.json(responsePayload);
+  } catch (err) {
+    console.error("[copilot] fatal", err);
+
+    const latencyMs = Date.now() - startedAt;
+    const fallback = buildFallbackJson({
+      mode: mode || "data_qa",
+      evidence: {
+        context_meta: {
+          wellId: wellId || "UNKNOWN_WELL",
+          range: { fromDepth, toDepth },
+          curves: [],
+        },
+        deterministic: {},
+        narrative: {},
+      },
+      compare: { summary: "", delta_metrics: [] },
+    });
+
+    const finalJson = patchDirectAnswerFromEvidence(fallback, {
+      context_meta: { wellId: wellId || "UNKNOWN_WELL", range: { fromDepth, toDepth }, curves: [] },
+      deterministic: {},
+      narrative: {},
+    }, question);
+
+    const responsePayload = {
+      ok: true,
+      source: "fallback",
+      schema_valid: true,
+      schema_errors: [],
+      evidence_strength: "low",
+      json: finalJson,
+      llm_error: "route_exception",
+      error: String(err?.message || err),
+      latency_ms: latencyMs,
+    };
+
+    try {
+      await insertCopilotRunRow({
+        source: "fallback",
+        llmUsed: false,
+        schemaValid: true,
+        modelName: null,
+        latencyMs,
+        llmError: "route_exception",
+        question: question || "No question",
+        mode: mode || "data_qa",
+        wellId: wellId || "UNKNOWN_WELL",
+        fromDepth,
+        toDepth,
+        curves: [],
+        responseJson: finalJson,
+        evidenceJson: {},
+        schemaErrors: [],
+      });
+    } catch (dbErr) {
+      console.warn("[copilot] DB insert failed:", dbErr?.message || dbErr);
+    }
+
+    return res.status(200).json(responsePayload);
+  }
+});
+
+// ---------- COPILOT HARDENED HELPERS ----------
+function isObject(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+function toNum(v, def = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function safeStr(v, def = "") {
+  if (v === null || v === undefined) return def;
+  const s = String(v).trim();
+  return s || def;
+}
+
+function safeArr(v) {
+  return Array.isArray(v) ? v : [];
+}
+
+function parseMaybeJsonString(x) {
+  if (typeof x !== "string") return null;
+  try {
+    const p = JSON.parse(x);
+    return isObject(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeCopilotSchema(x) {
+  return (
+    isObject(x) &&
+    typeof x.answer_title === "string" &&
+    typeof x.direct_answer === "string" &&
+    Array.isArray(x.key_points)
+  );
+}
+
+function extractCandidateFromPython(pyResp) {
+  if (!isObject(pyResp)) return { candidate: null, reason: "python_non_object_response" };
+
+  // common shapes
+  const candidates = [
+    pyResp?.json,
+    pyResp?.answer,
+    pyResp?.result,
+    pyResp?.data?.json,
+    pyResp?.data?.answer,
+    pyResp?.data?.result,
+    pyResp, // root as schema
+  ];
+
+  for (const c of candidates) {
+    if (looksLikeCopilotSchema(c)) return { candidate: c, reason: null };
+    const parsed = parseMaybeJsonString(c);
+    if (looksLikeCopilotSchema(parsed)) return { candidate: parsed, reason: null };
+  }
+
+  // sometimes whole response itself is stringified JSON
+  const rootParsed = parseMaybeJsonString(pyResp);
+  if (looksLikeCopilotSchema(rootParsed)) return { candidate: rootParsed, reason: null };
+
+  return { candidate: null, reason: "python_response_unrecognized_shape" };
+}
+
+function inferSource(pyResp, llmCandidateExists) {
+  if (!llmCandidateExists) return "fallback";
+  const src = safeStr(pyResp?.source, "").toLowerCase();
+  const llmUsed = pyResp?.llm_used === true || pyResp?.meta?.llm_used === true;
+  if (llmUsed) return "llm";
+  if (src === "llm" || src === "python") return "llm";
+  if (src === "fallback" || src === "python_fallback") return "fallback";
+  return "llm";
+}
+
+function isGenericDirectAnswer(ans = "") {
+  const t = safeStr(ans, "").toLowerCase();
+  if (!t || t.length < 24) return true;
+  const badPhrases = [
+    "parameters that should be seen",
+    "various indicators",
+    "generally suggests",
+    "it appears that",
+    "in this context",
+    "based on available data it appears",
+  ];
+  return badPhrases.some((p) => t.includes(p));
+}
+
+function getTopNarrativeInterval(evidence) {
+  const intervals = safeArr(evidence?.narrative?.interval_explanations);
+  if (!intervals.length) return null;
+  const x = intervals[0];
+  const fd = toNum(x?.fromDepth);
+  const td = toNum(x?.toDepth);
+  if (!Number.isFinite(fd) || !Number.isFinite(td)) return null;
+  return {
+    fromDepth: Math.min(fd, td),
+    toDepth: Math.max(fd, td),
+    curve: safeStr(x?.curve, "-"),
+    explanation: safeStr(x?.explanation, "pattern anomaly"),
+    confidence: toNum(x?.confidence),
+  };
+}
+
+// IMPORTANT: numeric depth query should be treated as valid target (not missing entity)
+function isDepthQuery(question = "") {
+  const q = safeStr(question).toLowerCase();
+  // numeric depth mention e.g. "at 12800"
+  const hasNumber = /\b\d{3,6}(\.\d+)?\b/.test(q);
+  const hasDepthWord = /(depth|at|around|near)\b/.test(q);
+  return hasNumber && hasDepthWord;
+}
+
+function patchDirectAnswerFromEvidence(json, evidence, question = "") {
+  const out = isObject(json) ? { ...json } : {};
+  const det = isObject(evidence?.deterministic) ? evidence.deterministic : {};
+  const nar = isObject(evidence?.narrative) ? evidence.narrative : {};
+  const intervals = safeArr(nar?.interval_explanations);
+
+  const sev = safeStr(det?.severityBand, "UNKNOWN");
+  const dq = safeStr(det?.dataQuality?.qualityBand, "UNKNOWN");
+  const wellId = safeStr(evidence?.context_meta?.wellId, "-");
+  const f = toNum(evidence?.context_meta?.range?.fromDepth);
+  const t = toNum(evidence?.context_meta?.range?.toDepth);
+
+  const q = safeStr(question).toLowerCase();
+  const asksSpike = /(spike|anomaly|abnormal|flagged|why interval)/.test(q);
+  const asksDepth = isDepthQuery(q);
+
+  const top = getTopNarrativeInterval(evidence);
+
+  if (asksDepth) {
+    // try extract asked depth and answer around that
+    const m = q.match(/\b(\d{3,6}(?:\.\d+)?)\b/);
+    const asked = m ? Number(m[1]) : null;
+
+    if (Number.isFinite(asked)) {
+      let nearest = null;
+      let best = Infinity;
+      for (const it of intervals) {
+        const a = toNum(it?.fromDepth);
+        const b = toNum(it?.toDepth);
+        if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+        const lo = Math.min(a, b), hi = Math.max(a, b);
+        const dist = asked < lo ? lo - asked : asked > hi ? asked - hi : 0;
+        if (dist < best) {
+          best = dist;
+          nearest = it;
+        }
+      }
+
+      out.answer_title = `Depth-focused view at ${asked} ft`;
+      if (nearest) {
+        const lo = toNum(nearest.fromDepth), hi = toNum(nearest.toDepth);
+        const curve = safeStr(nearest.curve, "-");
+        const exp = safeStr(nearest.explanation, "anomalous pattern");
+        out.direct_answer =
+          dist === 0
+            ? `At ${asked} ft, the depth lies inside a flagged interval ${lo.toFixed(1)}–${hi.toFixed(1)} ft (${curve}): ${exp}.`
+            : `At ${asked} ft, no exact flagged interval is centered there; nearest flagged interval is ${lo.toFixed(1)}–${hi.toFixed(1)} ft (${curve}): ${exp}.`;
+      } else {
+        out.direct_answer =
+          `At ${asked} ft, no interval explanation is available in narrative evidence. Current deterministic signal is severity=${sev}, data quality=${dq} for ${wellId} (${Number.isFinite(f) ? f.toFixed(1) : "-"}–${Number.isFinite(t) ? t.toFixed(1) : "-"} ft).`;
+      }
+    }
+  } else if (asksSpike && top) {
+    out.answer_title = "Spike Location Summary";
+    out.direct_answer =
+      `Most likely spike/anomaly zone is ${top.fromDepth.toFixed(1)}–${top.toDepth.toFixed(1)} ft (${top.curve}): ${top.explanation}`;
+  } else if (isGenericDirectAnswer(out.direct_answer)) {
+    out.direct_answer =
+      `The selected interval appears flagged by anomaly evidence (severity: ${sev}, data quality: ${dq}) for well ${wellId}.`;
+  }
+
+  if (!Array.isArray(out.key_points) || out.key_points.length === 0) {
+    out.key_points = [
+      `Well: ${wellId}`,
+      `Analyzed range: ${Number.isFinite(f) ? f.toFixed(1) : "-"}–${Number.isFinite(t) ? t.toFixed(1) : "-"} ft`,
+      `Severity band: ${sev}`,
+      `Data quality: ${dq}`,
+      ...(top ? [`Top explained interval: ${top.fromDepth.toFixed(1)}–${top.toDepth.toFixed(1)} ft`] : []),
+    ];
+  }
+
+  if (!Array.isArray(out.actions) || out.actions.length === 0) {
+    out.actions = [
+      {
+        priority: "medium",
+        action: "Re-run interpretation on a narrower interval around flagged zone",
+        rationale: "Improves localization confidence and reduces ambiguity.",
+      },
+    ];
+  }
+
+  if (!isObject(out.confidence)) {
+    out.confidence = {
+      overall: 0.55,
+      rubric: "medium",
+      reason: "Derived from deterministic evidence and narrative interval availability.",
+    };
+  }
+
+  if (!Array.isArray(out.evidence_used) || out.evidence_used.length === 0) {
+    out.evidence_used = [
+      {
+        source: "deterministic",
+        confidence: "high",
+        snippet: `severity=${sev}, dataQuality=${dq}, eventCount=${det?.eventCount ?? "n/a"}`,
+      },
+    ];
+  }
+
+  out.safety_note = "Decision support only, not autonomous control.";
+  return out;
+}
+
+async function insertCopilotRunRow({
+  source,
+  llmUsed,
+  schemaValid,
+  modelName,
+  latencyMs,
+  llmError,
+  question,
+  mode,
+  wellId,
+  fromDepth,
+  toDepth,
+  curves,
+  responseJson,
+  evidenceJson,
+  schemaErrors,
+}) {
+  // Ensure NOT NULL well_id always gets a value
+  const safeWell = safeStr(wellId, "UNKNOWN_WELL");
+
+  await pgPool.query(
+    `
+    INSERT INTO copilot_runs (
+      source, llm_used, schema_valid, model_name, latency_ms, llm_error,
+      question, mode, well_id, from_depth, to_depth, curves,
+      response_json, evidence_json, schema_errors
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6,
+      $7, $8, $9, $10, $11, $12::jsonb,
+      $13::jsonb, $14::jsonb, $15::jsonb
+    )
+    `,
+    [
+      source,
+      !!llmUsed,
+      !!schemaValid,
+      modelName || null,
+      Number.isFinite(Number(latencyMs)) ? Number(latencyMs) : 0,
+      llmError || null,
+      safeStr(question, "No question"),
+      safeStr(mode, "data_qa"),
+      safeWell,
+      Number.isFinite(Number(fromDepth)) ? Number(fromDepth) : null,
+      Number.isFinite(Number(toDepth)) ? Number(toDepth) : null,
+      JSON.stringify(safeArr(curves)),
+      JSON.stringify(isObject(responseJson) ? responseJson : {}),
+      JSON.stringify(isObject(evidenceJson) ? evidenceJson : {}),
+      JSON.stringify(Array.isArray(schemaErrors) ? schemaErrors : []),
+    ]
+  );
+}
+
+// ---------- HARDENED ROUTE ----------
+/**
+ * Helper: persist copilot run
+ * Keep this in same file OR move to backend/services/copilotStore.js and import.
+ */
+async function persistCopilotRun({
+  pgPool,
+  mode,
+  question,
+  evidence,
+  source,
+  llmUsed,
+  modelName,
+  schemaValid,
+  llmError,
+  evidenceStrength,
+  latencyMs,
+  candidateJson,
+  appVersion,
+}) {
+  const sql = `
+    INSERT INTO copilot_runs (
+      well_id, mode, question, from_depth, to_depth, curves,
+      deterministic, narrative, insight, recent_history,
+      source, llm_used, model_name, schema_valid, llm_error,
+      evidence_strength, latency_ms, response_json, app_version
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6::jsonb,
+      $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb,
+      $11, $12, $13, $14, $15,
+      $16, $17, $18::jsonb, $19
+    )
+    RETURNING run_id, created_at;
+  `;
+
+  const wellId = evidence?.context_meta?.wellId || "-";
+  const fromDepth = Number(evidence?.context_meta?.range?.fromDepth);
+  const toDepth = Number(evidence?.context_meta?.range?.toDepth);
+  const curves = Array.isArray(evidence?.context_meta?.curves) ? evidence.context_meta.curves : [];
+
+  const values = [
+    wellId,
+    mode,
+    question,
+    Number.isFinite(fromDepth) ? fromDepth : null,
+    Number.isFinite(toDepth) ? toDepth : null,
+    JSON.stringify(curves),
+
+    JSON.stringify(evidence?.deterministic || {}),
+    JSON.stringify(evidence?.narrative || {}),
+    JSON.stringify(evidence?.insight || {}),
+    JSON.stringify(Array.isArray(evidence?.recent_history) ? evidence.recent_history : []),
+
+    source || "fallback",
+    !!llmUsed,
+    modelName || null,
+    !!schemaValid,
+    llmError || null,
+
+    evidenceStrength || "medium",
+    Number.isFinite(Number(latencyMs)) ? Number(latencyMs) : 0,
+    JSON.stringify(candidateJson || {}),
+    appVersion || "phase-1.2",
+  ];
+
+  const out = await pgPool.query(sql, values);
+  return out?.rows?.[0] || null;
+}
+
+
+
+
+
+
 
 router.post("/interpret/export/pdf", async (req, res) => {
   let doc = null;
 
   try {
-    // Compute/validate first (before pipe)
     const payload = req.body || {};
     const wellId = String(payload?.well?.wellId || payload?.wellId || "-");
     const range = payload?.range || {};
@@ -718,7 +1779,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
 
     const filename = `interpretation_report_${wellId}_${Date.now()}.pdf`;
 
-    // Start streaming only after all above variables are ready
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
@@ -733,7 +1793,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       },
     });
 
-    // stream safety
     doc.on("error", (e) => {
       console.error("PDFKit error:", e);
       if (!res.headersSent) {
@@ -743,7 +1802,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       }
     });
 
-    // if client disconnects early
     res.on("close", () => {
       if (doc && !doc.destroyed) {
         try { doc.end(); } catch {}
@@ -752,7 +1810,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
 
     doc.pipe(res);
 
-    // ===== Header =====
     drawRoundedRect(doc, 40, 38, 515, 92, 8, "#f8fafc", "#e5e7eb");
     doc.font("Helvetica-Bold").fontSize(18).fillColor("#111827")
       .text("AI Interpretation Report", 54, 50);
@@ -765,7 +1822,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
 
     doc.y = 140;
 
-    // ===== Meta =====
     drawRoundedRect(doc, 40, doc.y, 515, 78, 6, "#ffffff", "#e5e7eb");
     doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Well", 52, doc.y + 12);
     doc.font("Helvetica").fontSize(10).fillColor("#111827").text(wellId, 160, doc.y + 11);
@@ -790,7 +1846,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
 
     doc.y += 88;
 
-    // ===== Executive Summary =====
     drawSectionTitle(doc, "Executive Summary");
     ensureSpace(doc, 90);
 
@@ -824,7 +1879,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       doc.y += 62;
     }
 
-    // ===== Top Intervals (simple list/table-like) =====
     drawSectionTitle(doc, "Top Intervals");
     ensureSpace(doc, 70);
 
@@ -848,7 +1902,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       doc.y += 4;
     }
 
-    // ===== Consolidated =====
     drawSectionTitle(doc, "Consolidated Intervals (Composite)");
     ensureSpace(doc, 60);
 
@@ -872,7 +1925,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       doc.y += 4;
     }
 
-    // ===== Recommendations =====
     drawSectionTitle(doc, "Recommendations");
     ensureSpace(doc, 45);
     if (!recommendations.length) {
@@ -891,7 +1943,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       doc.y = y + 2;
     }
 
-    // ===== Limitations =====
     drawSectionTitle(doc, "Limitations");
     ensureSpace(doc, 45);
     if (!limitations.length) {
@@ -910,7 +1961,6 @@ router.post("/interpret/export/pdf", async (req, res) => {
       doc.y = y + 2;
     }
 
-    // Footers all pages
     const pageCount = doc.bufferedPageRange().count;
     for (let i = 0; i < pageCount; i++) {
       doc.switchToPage(i);
@@ -920,16 +1970,65 @@ router.post("/interpret/export/pdf", async (req, res) => {
     doc.end();
   } catch (err) {
     console.error("POST /api/ai/interpret/export/pdf failed:", err);
-
-    // DO NOT write JSON if stream already started
     if (!res.headersSent) {
       return res.status(500).json({ error: err?.message || "PDF export failed" });
     }
-
-    // If already streaming, just end safely
     try { res.end(); } catch {}
   }
 });
+
+
+router.get("/copilot/runs", async (req, res) => {
+  try {
+    const wellId = req.query.wellId ? String(req.query.wellId) : undefined;
+    const limit = Number(req.query.limit) || 20;
+    const runs = await listCopilotRuns({ wellId, limit });
+    return res.json({ ok: true, runs });
+  } catch (err) {
+    console.error("GET /api/ai/copilot/runs failed:", err);
+    return res.status(500).json({ error: err?.message || "Failed to list copilot runs" });
+  }
+});
+
+router.get("/copilot/runs/:id", async (req, res) => {
+  try {
+    const row = await getCopilotRunById(req.params.id);
+    if (!row) return res.status(404).json({ error: "Copilot run not found" });
+    return res.json({ ok: true, run: row });
+  } catch (err) {
+    console.error("GET /api/ai/copilot/runs/:id failed:", err);
+    return res.status(500).json({ error: err?.message || "Failed to fetch copilot run" });
+  }
+});
+
+
+
+
+// GET /api/ai/copilot/history?wellId=WELL_...&limit=20
+router.get("/copilot/history", async (req, res) => {
+  try {
+    const wellId = String(req.query.wellId || "").trim();
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 20)));
+
+    const sql = `
+      SELECT run_id, created_at, well_id, mode, question, source, llm_used,
+             schema_valid, evidence_strength, latency_ms, response_json
+      FROM copilot_runs
+      ${wellId ? "WHERE well_id = $1" : ""}
+      ORDER BY created_at DESC
+      LIMIT ${wellId ? "$2" : "$1"}
+    `;
+    const vals = wellId ? [wellId, limit] : [limit];
+    const out = await pgPool.query(sql, vals);
+
+    return res.json({ ok: true, count: out.rowCount, rows: out.rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+
 
 
 

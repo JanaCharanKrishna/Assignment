@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple,Any
 import numpy as np
+import os
+
+# other imports...
 
 app = FastAPI()
 
@@ -64,6 +67,10 @@ def rolling_mean(x: np.ndarray, w: int) -> np.ndarray:
     den = np.convolve(mask, kernel, mode="same")
     out = np.where(den > 0, num / np.maximum(den, EPS), np.nan)
     return out
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
 
 def contiguous_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
@@ -876,3 +883,85 @@ def interpret(req: InterpretRequest):
         "deterministic": deterministic,
         "insight": insight,
     }
+
+
+class CopilotRequest(BaseModel):
+    mode: str = "data_qa"
+    question: str = "What does this data say?"
+    wellId: str
+    fromDepth: float
+    toDepth: float
+    selectedInterval: Optional[Dict[str, Any]] = None
+    curves: List[str] = Field(default_factory=list)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    compare: Dict[str, Any] = Field(default_factory=dict)
+
+def build_fallback_json(req: CopilotRequest) -> Dict[str, Any]:
+    # keep your own fallback builder if already exists
+    nar = req.evidence.get("narrative", {}) if isinstance(req.evidence, dict) else {}
+    ivals = nar.get("interval_explanations", []) if isinstance(nar, dict) else []
+    top = ivals[0] if ivals else {}
+    det = req.evidence.get("deterministic", {}) if isinstance(req.evidence, dict) else {}
+    dq = ((det.get("dataQuality") or {}).get("qualityBand")) if isinstance(det, dict) else None
+    sev = det.get("severityBand") if isinstance(det, dict) else None
+
+    ans = "No strong anomaly found in selected interval."
+    if top:
+        ans = f"Most likely anomaly zone is {top.get('fromDepth')}–{top.get('toDepth')} ft ({top.get('curve','-')}): {top.get('explanation','')}".strip()
+
+    return {
+        "answer_title": "Copilot Answer",
+        "direct_answer": ans,
+        "key_points": [
+            f"Well: {req.wellId}",
+            f"Analyzed range: {req.fromDepth}–{req.toDepth} ft",
+            f"Severity band: {sev or '-'}",
+            f"Data quality: {dq or '-'}",
+        ],
+        "actions": [
+            {
+                "priority": "medium",
+                "action": "Re-run interpretation on narrower interval",
+                "rationale": "Improves explanation specificity and depth localization."
+            }
+        ],
+        "comparison": req.compare if isinstance(req.compare, dict) else {"summary":"","delta_metrics":[]},
+        "risks": ["Elevated anomaly severity in current evidence window."] if str(sev or "").upper() in ("HIGH","CRITICAL") else [],
+        "uncertainties": [],
+        "confidence": {"overall": 0.65, "rubric": "medium", "reason": "Evidence-weighted estimate."},
+        "evidence_used": [],
+        "safety_note": "Decision support only, not autonomous control."
+    }
+
+def call_llm_and_get_json(req: CopilotRequest) -> Dict[str, Any]:
+    """
+    Put your real LLM call here and return schema JSON only.
+    Raise exception on failure.
+    """
+    # TODO: your actual Groq/OpenAI call
+    raise RuntimeError("LLM not wired")  # remove when wired
+
+@app.post("/copilot/query")
+async def copilot_query(req: CopilotRequest):
+    model_name = os.getenv("LLM_PRIMARY", "")
+    try:
+        # Try LLM first
+        llm_json = call_llm_and_get_json(req)
+
+        return {
+            "ok": True,
+            "source": "llm",
+            "llm_used": True,
+            "model": model_name or "configured-llm",
+            "json": llm_json
+        }
+    except Exception as e:
+        fb = build_fallback_json(req)
+        return {
+            "ok": True,
+            "source": "fallback",
+            "llm_used": False,
+            "model": None,
+            "json": fb,
+            "error": str(e)
+        }
