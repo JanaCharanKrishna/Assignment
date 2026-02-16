@@ -12,6 +12,7 @@ import { buildWindowPlan } from "../services/windowPlanService.js";
 import { fetchWindowData } from "../services/windowFetchService.js";
 import { buildEventTimeline, TIMELINE_FEATURE_VERSION } from "../services/timelineService.js";
 import { computeCrossplotMatrix, CROSSPLOT_FEATURE_VERSION } from "../services/crossplotService.js";
+import { isLasS3Enabled, uploadLasTextToS3 } from "../services/s3UploadService.js";
 import { logger } from "../observability/logger.js";
 import {
   eventTimelineDuration,
@@ -103,6 +104,11 @@ router.post("/las/upload", upload.single("file"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded. form-data key must be 'file'" });
     }
+    if (!isLasS3Enabled()) {
+      return res.status(500).json({
+        error: "S3 upload is required but not configured. Set S3_LAS_BUCKET and AWS_REGION.",
+      });
+    }
 
     const db = getDb();
     const wellsCol = db.collection("wells");
@@ -115,6 +121,11 @@ router.post("/las/upload", upload.single("file"), async (req, res) => {
 
     const wellId = `WELL_${Date.now()}`;
     const name = path.parse(req.file.originalname).name || wellId;
+    const s3Object = await uploadLasTextToS3({
+      wellId,
+      originalName: req.file.originalname,
+      text,
+    });
 
     // metrics: all curves except depth curve (assume first is depth)
     const metricIds = parsed.curves.slice(1).map((c) => c.id).filter((id) => !isTimeCurveIdOrName(id));
@@ -134,6 +145,7 @@ router.post("/las/upload", upload.single("file"), async (req, res) => {
       depthCurveId: parsed.depthCurveId,
       pointCount: parsed.rows.length,
       version,
+      lasObject: s3Object,
       createdAt: new Date(),
     });
 
@@ -157,6 +169,7 @@ router.post("/las/upload", upload.single("file"), async (req, res) => {
       metrics: metricIds,
       points: parsed.rows.length,
       meta: { minDepth: parsed.minDepth, maxDepth: parsed.maxDepth, nullValue: parsed.nullValue },
+      storage: { provider: "s3", bucket: s3Object.bucket, key: s3Object.key, region: s3Object.region },
     });
   } catch (err) {
     console.error(err);
