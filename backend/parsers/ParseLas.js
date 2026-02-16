@@ -49,6 +49,14 @@ function parseCurveLine(line) {
   return { id, name, unit, description, track };
 }
 
+function isTimeCurve(curve, depthCurveId) {
+  const id = String(curve?.id || "").trim().toUpperCase();
+  const name = String(curve?.name || "").trim().toUpperCase();
+  if (!id && !name) return false;
+  if (depthCurveId && String(depthCurveId).toUpperCase() === id) return false;
+  return id === "TIME" || id.startsWith("TIME__") || name === "TIME";
+}
+
 function parseAsciiRows(lines, curveOrderIds, nullValue) {
   const rows = [];
   for (const line of lines) {
@@ -122,6 +130,21 @@ export function parseLasText(text) {
   const rows = parseAsciiRows(sections.ascii, curveOrderIds, nullValue);
   if (!rows.length) throw new Error("No data rows found in ~Ascii section");
 
+  // Parse all columns for positional integrity, then remove TIME curves from exposed output.
+  const timeCurveIds = new Set(
+    curves
+      .filter((c) => isTimeCurve(c, depthCurveId))
+      .map((c) => c.id)
+  );
+  if (timeCurveIds.size) {
+    for (const r of rows) {
+      for (const id of timeCurveIds) {
+        delete r.curves[id];
+      }
+    }
+  }
+  const visibleCurves = curves.filter((c) => !timeCurveIds.has(c.id));
+
   // depth range
   let minDepth = Infinity;
   let maxDepth = -Infinity;
@@ -133,7 +156,7 @@ export function parseLasText(text) {
   }
 
   return {
-    curves,
+    curves: visibleCurves,
     nullValue,
     depthCurveId,
     minDepth,

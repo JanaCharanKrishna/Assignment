@@ -1,0 +1,6 @@
+{
+  "depthToleranceFt": 3.0,
+  "scoreToleranceAbs": 0.75,
+  "minIoU": 0.7,
+  "minMultiCurveCount": 1
+}

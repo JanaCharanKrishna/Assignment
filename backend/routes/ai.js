@@ -1,4 +1,5 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { callAiInterpret } from "../services/aiClient.js";
 import { pgPool } from "../db/postgres.js";
 
@@ -40,6 +41,31 @@ import { consolidateMultiCurveIntervals } from "../services/multiCurveConsolidat
 import { validateCopilotResponse } from "../services/copilotSchema.js";
 import { registerInterpretExportPdfRoute } from "./ai/pdfExportRoute.js";
 import { registerCopilotHistoryRoutes } from "./ai/copilotHistoryRoutes.js";
+import { logger } from "../observability/logger.js";
+import {
+  interpretDuration,
+  narrativeFallback,
+  intervalDiffDuration,
+  feedbackWriteTotal,
+  feedbackReadTotal,
+  featureErrorTotal,
+} from "../observability/metrics.js";
+import {
+  computeIntervalDiff,
+  DET_MODEL_VERSION,
+  THRESHOLD_VERSION,
+  FEATURE_VERSION,
+} from "../services/intervalDiffService.js";
+import {
+  validateFeedbackPayload,
+  insertFeedback,
+  listFeedback,
+  getFeedbackSummary,
+  getFeedbackAdvisory,
+  FEEDBACK_DEDUPE_POLICY,
+} from "../services/feedbackService.js";
+import { cacheGetJson, cacheSetJson } from "../cache/redisCache.js";
+import { metricsHash } from "../utils/keyBuilder.js";
 
 const router = express.Router();
 
@@ -74,6 +100,35 @@ function normalizeRange(fromDepth, toDepth) {
 function timeoutMsFromEnv(name, fallback) {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function responseMeta(req, runId = null) {
+  return {
+    requestId: req.requestId || null,
+    runId: runId || null,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+function parseCurveCsv(v) {
+  if (Array.isArray(v)) return [...new Set(v.map((x) => String(x || "").trim()).filter(Boolean))];
+  return [...new Set(String(v || "").split(",").map((x) => x.trim()).filter(Boolean))];
+}
+
+function featureVersionEnvelope({
+  featureName,
+  featureVersion,
+  detModelVersion,
+  thresholdVersion,
+  algoHash,
+}) {
+  return {
+    feature: featureName,
+    featureVersion: featureVersion || null,
+    detModelVersion: detModelVersion || null,
+    thresholdVersion: thresholdVersion || null,
+    algoHash: algoHash || null,
+  };
 }
 
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 45000) {
@@ -625,6 +680,166 @@ function mergeNarrativeIntervals(llmIntervals, deterministic) {
   return merged.slice(0, 12);
 }
 
+function toFiniteNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function mean(values) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function percentile(values, q) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0];
+  const pos = q * (sorted.length - 1);
+  const lo = Math.floor(pos);
+  const hi = Math.min(lo + 1, sorted.length - 1);
+  const frac = pos - lo;
+  return sorted[lo] + frac * (sorted[hi] - sorted[lo]);
+}
+
+function trendLabel(values) {
+  if (!Array.isArray(values) || values.length < 12) return "insufficient points";
+  const window = Math.max(3, Math.floor(values.length / 5));
+  const head = mean(values.slice(0, window));
+  const tail = mean(values.slice(-window));
+  if (!Number.isFinite(head) || !Number.isFinite(tail)) return "insufficient points";
+  const delta = tail - head;
+  const scale = Math.max(Math.abs(head), Math.abs(tail), 1e-9);
+  const rel = delta / scale;
+  if (rel >= 0.08) return "increasing with depth";
+  if (rel <= -0.08) return "decreasing with depth";
+  return "mostly stable";
+}
+
+function pearson(valuesA, valuesB) {
+  const n = Math.min(valuesA.length, valuesB.length);
+  if (n < 3) return null;
+  const a = valuesA.slice(0, n);
+  const b = valuesB.slice(0, n);
+  const meanA = mean(a);
+  const meanB = mean(b);
+  if (!Number.isFinite(meanA) || !Number.isFinite(meanB)) return null;
+  let numerator = 0;
+  let denA = 0;
+  let denB = 0;
+  for (let i = 0; i < n; i += 1) {
+    const da = a[i] - meanA;
+    const db = b[i] - meanB;
+    numerator += da * db;
+    denA += da * da;
+    denB += db * db;
+  }
+  const den = Math.sqrt(denA * denB);
+  if (!Number.isFinite(den) || den === 0) return null;
+  return numerator / den;
+}
+
+function buildCurveStatsFromRows(rows, curves) {
+  const stats = {};
+  for (const curve of toArr(curves)) {
+    const vals = [];
+    for (const row of toArr(rows)) {
+      const v = toFiniteNumber(row?.[curve]);
+      if (Number.isFinite(v)) vals.push(v);
+    }
+    if (vals.length) {
+      stats[curve] = {
+        min: Math.min(...vals),
+        max: Math.max(...vals),
+        mean: mean(vals),
+        non_null_count: vals.length,
+      };
+    } else {
+      stats[curve] = {
+        min: null,
+        max: null,
+        mean: null,
+        non_null_count: 0,
+      };
+    }
+  }
+  return stats;
+}
+
+function buildNarrativeDiagnostics(rows, curves, fromDepth, toDepth) {
+  const safeRows = toArr(rows);
+  const safeCurves = toArr(curves);
+  const lines = [
+    `Interval length: ${num(Number(toDepth) - Number(fromDepth), 2)}`,
+    `Rows in scope: ${safeRows.length}`,
+    `Curves analyzed: ${safeCurves.join(", ")}`,
+  ];
+
+  const stats = buildCurveStatsFromRows(safeRows, safeCurves);
+  const dominantCurves = [...safeCurves]
+    .map((c) => {
+      const s = stats[c] || {};
+      const cmin = toFiniteNumber(s.min);
+      const cmax = toFiniteNumber(s.max);
+      const count = Number(s.non_null_count || 0);
+      const range = Number.isFinite(cmin) && Number.isFinite(cmax) ? cmax - cmin : -Infinity;
+      return { curve: c, range, count };
+    })
+    .filter((x) => x.count > 0 && Number.isFinite(x.range))
+    .sort((a, b) => b.range - a.range)
+    .slice(0, 4)
+    .map((x) => x.curve);
+
+  lines.push(
+    `Dominant-variance curves: ${
+      dominantCurves.length ? dominantCurves.join(", ") : "none"
+    }`
+  );
+
+  const valuesByCurve = {};
+  for (const curve of (dominantCurves.length ? dominantCurves : safeCurves.slice(0, 4))) {
+    const pairs = [];
+    for (const row of safeRows) {
+      const depth = toFiniteNumber(row?.depth);
+      const value = toFiniteNumber(row?.[curve]);
+      if (!Number.isFinite(depth) || !Number.isFinite(value)) continue;
+      pairs.push([depth, value]);
+    }
+    if (pairs.length < 3) continue;
+
+    const values = pairs.map((p) => p[1]);
+    const depths = pairs.map((p) => p[0]);
+    valuesByCurve[curve] = values;
+
+    const p90 = percentile(values, 0.9);
+    const highDepths = Number.isFinite(p90) ? pairs.filter((p) => p[1] >= p90).map((p) => p[0]) : [];
+    const highZone = highDepths.length
+      ? `${num(Math.min(...highDepths), 1)}-${num(Math.max(...highDepths), 1)}`
+      : "n/a";
+
+    const maxVal = Math.max(...values);
+    const maxIdx = values.indexOf(maxVal);
+    lines.push(
+      `${curve}: trend=${trendLabel(values)}, mean=${num(mean(values), 4)}, max=${num(maxVal, 4)} at ${num(depths[maxIdx], 1)}, high-zone(p90+)=${highZone}`
+    );
+  }
+
+  const pairCandidates = Object.keys(valuesByCurve).slice(0, 3);
+  if (pairCandidates.length >= 2) {
+    for (let i = 0; i < pairCandidates.length; i += 1) {
+      for (let j = i + 1; j < pairCandidates.length; j += 1) {
+        const a = pairCandidates[i];
+        const b = pairCandidates[j];
+        const corr = pearson(valuesByCurve[a], valuesByCurve[b]);
+        if (Number.isFinite(corr)) {
+          lines.push(`Correlation ${a} vs ${b}: r=${num(corr, 4)}`);
+        }
+      }
+    }
+  }
+
+  return { stats, text: lines.map((x) => `- ${x}`).join("\n") };
+}
+
 /** Optional LLM polish for narrative */
 async function maybeGroqNarrative({
   deterministic,
@@ -633,10 +848,23 @@ async function maybeGroqNarrative({
   fromDepth,
   toDepth,
   wellId,
+  rows,
 }) {
   const detIntervals = Array.isArray(deterministic?.intervalFindings)
     ? deterministic.intervalFindings
     : [];
+  const forceFallback = process.env.FORCE_NARRATIVE_FALLBACK === "true";
+
+  if (forceFallback) {
+    return {
+      modelUsed: null,
+      narrativeStatus:
+        detIntervals.length === 0
+          ? "forced_fallback_test_no_events"
+          : "forced_fallback_test",
+      narrative: fallbackNarrativeFromDeterministic(deterministic),
+    };
+  }
 
   if (!GROQ_API_KEY) {
     return {
@@ -665,6 +893,16 @@ async function maybeGroqNarrative({
     curvesSupporting: f.curvesSupporting ?? null,
   }));
 
+  const diag = buildNarrativeDiagnostics(rows, curves, fromDepth, toDepth);
+  const curveStatsText = toArr(curves)
+    .map((curve) => {
+      const s = diag.stats?.[curve] || {};
+      const nn = Number(s?.non_null_count || 0);
+      if (nn <= 0) return `- ${curve}: no valid points`;
+      return `- ${curve}: min=${num(s.min, 4)}, max=${num(s.max, 4)}, mean=${num(s.mean, 4)}, points=${nn}`;
+    })
+    .join("\n");
+
   const prompt = `
 You are a petroleum/well-log interpretation assistant.
 
@@ -690,6 +928,12 @@ eventDensityPer1000ft=${deterministic?.eventDensityPer1000ft}
 Insight summary:
 ${insight?.summaryParagraph || ""}
 
+Curve statistics:
+${curveStatsText}
+
+Derived diagnostics:
+${diag.text}
+
 Top intervals:
 ${JSON.stringify(topIntervals)}
 
@@ -697,6 +941,8 @@ Rules:
 - Use cautious language: "suggests", "likely", "requires validation"
 - Do NOT claim lab-confirmed fluid type
 - Keep recommendations concise and operational
+- Every summary bullet and interval explanation must reference numeric evidence (depths, trend, mean/max, or correlation).
+- Avoid generic phrases like "varied behavior" without a number or curve-specific anchor.
 - IMPORTANT: If eventCount is 0, interval_explanations MUST be []
 `.trim();
 
@@ -745,7 +991,7 @@ Rules:
 
     return {
       modelUsed: GROQ_MODEL,
-      narrativeStatus: detIntervals.length === 0 ? "deterministic_no_events" : "ok",
+      narrativeStatus: detIntervals.length === 0 ? "deterministic_no_events" : "llm_ok",
       narrative: {
         summary_bullets: parsed?.summary_bullets || deterministic?.summary || [],
         interval_explanations: mergedIntervals,
@@ -830,32 +1076,72 @@ async function runDeterministicOnly({ wellId, fromDepth, toDepth, curves }) {
 /** ---------- routes ---------- **/
 
 router.post("/interpret", async (req, res) => {
+  const startedAt = Date.now();
+  const requestId = req.requestId || null;
+  let runId = randomUUID();
+
   try {
     const { wellId, fromDepth, toDepth, curves } = req.body || {};
 
-    if (!wellId) {
-      return res.status(400).json({ error: "wellId is required" });
-    }
-    if (!Array.isArray(curves) || curves.length === 0) {
-      return res.status(400).json({ error: "curves must be a non-empty array" });
-    }
-    if (!Number.isFinite(Number(fromDepth)) || !Number.isFinite(Number(toDepth))) {
-      return res
-        .status(400)
-        .json({ error: "fromDepth/toDepth must be valid numbers" });
-    }
-
-    const { rows, lo, hi } = await fetchRowsForRange({
+    logger.info({
+      msg: "interpret.start",
+      requestId,
+      runId,
+      route: "/api/ai/interpret",
       wellId,
       fromDepth,
       toDepth,
-      curves,
+      curveCount: Array.isArray(curves) ? curves.length : 0,
     });
 
-    if (rows.length < 20) {
+    if (!wellId) {
+      interpretDuration.labels("error").observe(Date.now() - startedAt);
+      return res.status(400).json({ ok: false, error: "wellId is required" });
+    }
+    if (!Array.isArray(curves) || curves.length === 0) {
+      interpretDuration.labels("error").observe(Date.now() - startedAt);
       return res
         .status(400)
-        .json({ error: `Not enough rows in selected range. Got ${rows.length}` });
+        .json({ ok: false, error: "curves must be a non-empty array" });
+    }
+    if (!Number.isFinite(Number(fromDepth)) || !Number.isFinite(Number(toDepth))) {
+      interpretDuration.labels("error").observe(Date.now() - startedAt);
+      return res
+        .status(400)
+        .json({ ok: false, error: "fromDepth/toDepth must be valid numbers" });
+    }
+    if (Number(fromDepth) > Number(toDepth)) {
+      interpretDuration.labels("error").observe(Date.now() - startedAt);
+      return res
+        .status(400)
+        .json({ ok: false, error: "fromDepth must be <= toDepth" });
+    }
+
+    let rowsResult;
+    try {
+      rowsResult = await fetchRowsForRange({
+        wellId,
+        fromDepth,
+        toDepth,
+        curves,
+      });
+    } catch (rangeErr) {
+      const msg = String(rangeErr?.message || rangeErr || "");
+      interpretDuration.labels("error").observe(Date.now() - startedAt);
+      const status = msg.toLowerCase().includes("well not found") ? 404 : 400;
+      return res.status(status).json({
+        ok: false,
+        error: msg || "Failed to fetch rows for range",
+      });
+    }
+
+    const { rows, lo, hi } = rowsResult;
+
+    if (rows.length < 20) {
+      interpretDuration.labels("error").observe(Date.now() - startedAt);
+      return res
+        .status(400)
+        .json({ ok: false, error: `Not enough rows in selected range. Got ${rows.length}` });
     }
 
     const ai = await callAiInterpret({
@@ -876,6 +1162,7 @@ router.post("/interpret", async (req, res) => {
       fromDepth: lo,
       toDepth: hi,
       wellId,
+      rows,
     });
 
     const qg = applyQualityGates({
@@ -895,7 +1182,13 @@ router.post("/interpret", async (req, res) => {
 
     const deterministic4 = consolidateMultiCurveIntervals(deterministic3);
     const deterministic5 = normalizeIntervalSupport(deterministic4);
-    const narrative3 = syncNarrativeWithDeterministic(narrative2, deterministic5);
+    const advisory = await getFeedbackAdvisory({
+      wellId,
+      fromDepth: lo,
+      toDepth: hi,
+    }).catch(() => ({ boost: 0, matches: 0 }));
+    const deterministic6 = applyFeedbackAdvisoryToDeterministic(deterministic5, advisory);
+    const narrative3 = syncNarrativeWithDeterministic(narrative2, deterministic6);
 
     let runRecord = null;
     try {
@@ -905,7 +1198,7 @@ router.post("/interpret", async (req, res) => {
           fromDepth: lo,
           toDepth: hi,
           curves,
-          deterministic: deterministic5,
+          deterministic: deterministic6,
           insight,
           narrative: narrative3,
           modelUsed: nar.modelUsed,
@@ -916,19 +1209,35 @@ router.post("/interpret", async (req, res) => {
         DB_WRITE_TIMEOUT_MS,
         "insertInterpretationRun"
       );
+      runId = runRecord?.runId ?? runRecord?.run_id ?? runId;
     } catch (dbErr) {
       console.warn("[interpret] non-blocking DB write failure:", dbErr?.message || dbErr);
     }
 
+    if (nar?.narrativeStatus && nar.narrativeStatus !== "llm_ok") {
+      narrativeFallback.labels(String(nar.narrativeStatus)).inc();
+    }
+    interpretDuration.labels("ok").observe(Date.now() - startedAt);
+    logger.info({
+      msg: "interpret.complete",
+      requestId,
+      runId,
+      route: "/api/ai/interpret",
+      wellId,
+      latencyMs: Date.now() - startedAt,
+      status: 200,
+      narrativeStatus: nar?.narrativeStatus || null,
+    });
+
     return res.json({
       ok: true,
       source: "fresh",
-      runId: runRecord?.runId ?? runRecord?.run_id ?? null,
+      runId: runRecord?.runId ?? runRecord?.run_id ?? runId,
       createdAt: runRecord?.createdAt ?? runRecord?.created_at ?? new Date().toISOString(),
       well: { wellId, name: wellId },
       range: { fromDepth: lo, toDepth: hi },
       curves,
-      deterministic: deterministic5,
+      deterministic: deterministic6,
       insight,
       narrative: narrative3,
       modelUsed: nar.modelUsed,
@@ -936,8 +1245,21 @@ router.post("/interpret", async (req, res) => {
       generatedAt: new Date().toISOString(),
     });
   } catch (err) {
+    interpretDuration.labels("error").observe(Date.now() - startedAt);
+    logger.error({
+      msg: "interpret.error",
+      requestId,
+      runId,
+      route: "/api/ai/interpret",
+      latencyMs: Date.now() - startedAt,
+      status: 500,
+      errorCode: "INTERPRET_FAILED",
+      err: err?.message || String(err),
+    });
     console.error("POST /api/ai/interpret failed:", err);
-    return res.status(500).json({ error: err?.message || "Interpretation failed" });
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message || "Interpretation failed" });
   }
 });
 
@@ -1066,6 +1388,23 @@ function fmtNum(v, digits = 1, fallback = "n/a") {
   return n.toFixed(safeDigits(digits, 1));
 }
 
+function flattenRowsForCopilot(rows, curves, maxRows = 1200) {
+  const sourceRows = toArr(rows);
+  if (!sourceRows.length) return [];
+  const stride = Math.max(1, Math.floor(sourceRows.length / Math.max(1, maxRows)));
+  const sampled = sourceRows.filter((_, idx) => idx % stride === 0).slice(0, maxRows);
+  return sampled.map((row) => {
+    const flat = { depth: toFiniteNumber(row?.depth) };
+    for (const curve of toArr(curves)) {
+      const key = asStr(curve, "");
+      if (!key) continue;
+      const v = toFiniteNumber(row?.[key] ?? row?.values?.[key]);
+      if (Number.isFinite(v)) flat[key] = v;
+    }
+    return flat;
+  });
+}
+
 function extractDepthFromQuestion(question = "") {
   const q = asStr(question, "");
   const m = q.match(/\b(\d{3,6}(?:\.\d+)?)\b/);
@@ -1165,6 +1504,8 @@ router.post("/copilot/query", async (req, res) => {
     fromDepth = toNum(body.fromDepth);
     toDepth = toNum(body.toDepth);
     const curves = safeArr(body.curves).map((x) => String(x));
+    const detailLevel = Math.max(1, Math.min(5, Number(body.detail_level ?? body.detailLevel ?? 3) || 3));
+    const history = safeArr(body.history).slice(-12);
 
     const evidence = {
       objective: { mode, question },
@@ -1223,6 +1564,8 @@ router.post("/copilot/query", async (req, res) => {
       thresholds,
     });
     evidence.baseline = baselineContext;
+    const copilotRows = flattenRowsForCopilot(localRows, curves, 1400);
+    const copilotStats = buildCurveStatsFromRows(copilotRows, curves);
 
     const originalIntervals = safeArr(evidence?.narrative?.interval_explanations);
     const taggedIntervals = tagIntervalsWithEvidenceType(originalIntervals, thresholds);
@@ -1446,6 +1789,10 @@ router.post("/copilot/query", async (req, res) => {
         toDepth,
         selectedInterval: body.selectedInterval || null,
         curves,
+        detail_level: detailLevel,
+        history,
+        statistics: copilotStats,
+        rows: copilotRows,
         evidence,
         compare,
       });
@@ -1706,6 +2053,54 @@ function normalizeIntervalSupport(det) {
       evidenceType: nextSupport >= 2 ? "multi-curve" : "single-curve",
     };
   });
+  return out;
+}
+
+function applyFeedbackAdvisoryToDeterministic(det, advisory) {
+  const boost = Number(advisory?.boost);
+  const out = det && typeof det === "object" ? { ...det } : {};
+  out.meta = out.meta && typeof out.meta === "object" ? { ...out.meta } : {};
+  out.meta.feedbackAdjustmentApplied = Number.isFinite(boost) && boost !== 0;
+  out.meta.feedbackAdjustment = Number.isFinite(boost) ? Number(boost.toFixed(4)) : 0;
+  out.meta.feedbackMatches = Number(advisory?.matches || 0);
+  out.meta.feedbackAdjustmentReason =
+    Number.isFinite(boost) && boost !== 0
+      ? boost > 0
+        ? "historical true_positive tendency"
+        : "historical false_positive tendency"
+      : "no overlapping feedback evidence";
+
+  if (!Number.isFinite(boost) || boost === 0) return out;
+
+  const arr = Array.isArray(out.intervalFindings) ? out.intervalFindings.map((x) => ({ ...x })) : [];
+  out.intervalFindings = arr.map((it) => {
+    const next = { ...it };
+    if (Number.isFinite(Number(next.confidence))) {
+      const v = Number(next.confidence) + boost;
+      next.confidence = Math.max(0, Math.min(1, Number(v.toFixed(4))));
+    }
+    if (Number.isFinite(Number(next.score2))) {
+      next.score2 = Number((Number(next.score2) + boost).toFixed(4));
+    }
+    if (Number.isFinite(Number(next.score))) {
+      next.score = Number((Number(next.score) + boost).toFixed(4));
+    }
+    return next;
+  });
+
+  if (Number.isFinite(Number(out.detectionConfidence))) {
+    const v = Number(out.detectionConfidence) + boost;
+    out.detectionConfidence = Math.max(0, Math.min(1, Number(v.toFixed(4))));
+  }
+  if (Number.isFinite(Number(out.confidence))) {
+    const v = Number(out.confidence) + boost;
+    out.confidence = Math.max(0, Math.min(1, Number(v.toFixed(4))));
+  }
+
+  out.feedbackAdvisory = {
+    boost: Number(boost.toFixed(4)),
+    matches: Number(advisory?.matches || 0),
+  };
   return out;
 }
 
@@ -2046,6 +2441,369 @@ async function persistCopilotRun({
 
 
 
+
+router.post("/interval-diff", async (req, res) => {
+  const runId = randomUUID();
+  const meta = responseMeta(req, runId);
+  const startedAt = Date.now();
+  const warnings = [];
+  const version = featureVersionEnvelope({
+    featureName: "interval-diff",
+    featureVersion: FEATURE_VERSION,
+    detModelVersion: DET_MODEL_VERSION,
+    thresholdVersion: THRESHOLD_VERSION,
+    algoHash: null,
+  });
+  try {
+    const { wellId, a, b, detailLevel, curves } = req.body || {};
+    if (!wellId) {
+      intervalDiffDuration.labels("error").observe(Date.now() - startedAt);
+      featureErrorTotal.labels("interval-diff", "bad_request").inc();
+      return res.status(400).json({
+        ok: false,
+        ...meta,
+        version,
+        payload: null,
+        warnings,
+        errors: ["wellId is required"],
+      });
+    }
+
+    const mergedCurves = parseCurveCsv(curves);
+    const aCurves = parseCurveCsv(a?.curves);
+    const bCurves = parseCurveCsv(b?.curves);
+    const effectiveCurves = [...new Set([...mergedCurves, ...aCurves, ...bCurves])];
+
+    const aFrom = Number(a?.fromDepth);
+    const aTo = Number(a?.toDepth);
+    const bFrom = Number(b?.fromDepth);
+    const bTo = Number(b?.toDepth);
+    if (![aFrom, aTo, bFrom, bTo].every(Number.isFinite)) {
+      intervalDiffDuration.labels("error").observe(Date.now() - startedAt);
+      featureErrorTotal.labels("interval-diff", "bad_request").inc();
+      return res.status(400).json({
+        ok: false,
+        ...meta,
+        version,
+        payload: null,
+        warnings,
+        errors: ["a.fromDepth, a.toDepth, b.fromDepth, b.toDepth are required numbers"],
+      });
+    }
+    if (!effectiveCurves.length) {
+      intervalDiffDuration.labels("error").observe(Date.now() - startedAt);
+      featureErrorTotal.labels("interval-diff", "bad_request").inc();
+      return res.status(400).json({
+        ok: false,
+        ...meta,
+        version,
+        payload: null,
+        warnings,
+        errors: ["At least one curve is required"],
+      });
+    }
+    const detail = Math.max(1, Math.min(5, Number(detailLevel) || 3));
+
+    const algoVersion = `${FEATURE_VERSION}:${DET_MODEL_VERSION}:${THRESHOLD_VERSION}`;
+    const baseCacheKey = `ai:interval-diff:${wellId}:${Math.min(aFrom, aTo)}:${Math.max(aFrom, aTo)}:${Math.min(bFrom, bTo)}:${Math.max(bFrom, bTo)}:m${metricsHash(effectiveCurves)}:d${detail}:v${algoVersion}`;
+    const cached = await cacheGetJson(baseCacheKey);
+    if (cached) {
+      intervalDiffDuration.labels("ok").observe(Date.now() - startedAt);
+      logger.info({
+        msg: "feature.complete",
+        feature: "interval-diff",
+        requestId: req.requestId || null,
+        runId,
+        wellId,
+        fromDepth: Math.min(aFrom, aTo),
+        toDepth: Math.max(bFrom, bTo),
+        durationMs: Date.now() - startedAt,
+        status: 200,
+        source: "redis",
+      });
+      return res.json({
+        ok: true,
+        ...meta,
+        ...cached,
+        version: featureVersionEnvelope({
+          featureName: "interval-diff",
+          featureVersion: cached?.featureVersion || FEATURE_VERSION,
+          detModelVersion: cached?.detModelVersion || DET_MODEL_VERSION,
+          thresholdVersion: cached?.thresholdVersion || THRESHOLD_VERSION,
+          algoHash: cached?.algoHash || null,
+        }),
+        payload: cached,
+        warnings: cached?.warnings || [],
+        errors: [],
+        source: "redis",
+      });
+    }
+
+    const diff = await computeIntervalDiff({
+      wellId: String(wellId),
+      intervalAInput: { ...(a || {}), curves: aCurves.length ? aCurves : effectiveCurves },
+      intervalBInput: { ...(b || {}), curves: bCurves.length ? bCurves : effectiveCurves },
+      detailLevel: detail,
+      curves: effectiveCurves,
+    });
+
+    const payload = {
+      wellId: diff.wellId,
+      intervalA: diff.intervalA,
+      intervalB: diff.intervalB,
+      curveDiff: diff.curveDiff,
+      eventDiff: diff.eventDiff,
+      topChanges: diff.topChanges,
+      narrativeDiff: diff.narrativeDiff,
+      detModelVersion: diff?.versions?.detModelVersion,
+      thresholdVersion: diff?.versions?.thresholdVersion,
+      featureVersion: diff?.versions?.featureVersion,
+      algoHash: diff?.versions?.algoHash,
+    };
+    version.algoHash = payload.algoHash || null;
+
+    await cacheSetJson(baseCacheKey, payload, 60 * 10);
+    intervalDiffDuration.labels("ok").observe(Date.now() - startedAt);
+    logger.info({
+      msg: "feature.complete",
+      feature: "interval-diff",
+      requestId: req.requestId || null,
+      runId,
+      wellId,
+      fromDepth: Math.min(aFrom, aTo),
+      toDepth: Math.max(bFrom, bTo),
+      durationMs: Date.now() - startedAt,
+      status: 200,
+      source: "fresh",
+    });
+    return res.json({
+      ok: true,
+      ...meta,
+      ...payload,
+      version,
+      payload,
+      warnings,
+      errors: [],
+      source: "fresh",
+    });
+  } catch (err) {
+    intervalDiffDuration.labels("error").observe(Date.now() - startedAt);
+    featureErrorTotal.labels("interval-diff", "runtime").inc();
+    logger.error({
+      msg: "feature.error",
+      feature: "interval-diff",
+      requestId: req.requestId || null,
+      runId,
+      wellId: req?.body?.wellId || null,
+      durationMs: Date.now() - startedAt,
+      status: 400,
+      error: err?.message || String(err),
+    });
+    return res.status(400).json({
+      ok: false,
+      ...meta,
+      version,
+      payload: null,
+      warnings,
+      errors: [err?.message || "interval diff failed"],
+    });
+  }
+});
+
+router.post("/feedback", async (req, res) => {
+  const meta = responseMeta(req, randomUUID());
+  const startedAt = Date.now();
+  const version = featureVersionEnvelope({
+    featureName: "feedback",
+    featureVersion: "feedback-v1",
+    detModelVersion: DET_MODEL_VERSION,
+    thresholdVersion: THRESHOLD_VERSION,
+    algoHash: `dedupe:${FEEDBACK_DEDUPE_POLICY}`,
+  });
+  const warnings = [];
+  try {
+    const checked = validateFeedbackPayload(req.body || {});
+    if (!checked.ok) {
+      feedbackWriteTotal.labels("error").inc();
+      featureErrorTotal.labels("feedback", "validation").inc();
+      return res.status(400).json({
+        ok: false,
+        ...meta,
+        version,
+        payload: null,
+        warnings,
+        errors: [checked.error],
+      });
+    }
+    const row = await insertFeedback(checked.value);
+    feedbackWriteTotal.labels("ok").inc();
+    logger.info({
+      msg: "feature.complete",
+      feature: "feedback-write",
+      requestId: req.requestId || null,
+      wellId: checked.value.wellId,
+      fromDepth: checked.value.fromDepth,
+      toDepth: checked.value.toDepth,
+      durationMs: Date.now() - startedAt,
+      status: 201,
+    });
+    const payload = {
+      feedback: row,
+      dedupePolicy: FEEDBACK_DEDUPE_POLICY,
+    };
+    return res.status(201).json({
+      ok: true,
+      ...meta,
+      ...payload,
+      version,
+      payload,
+      warnings,
+      errors: [],
+    });
+  } catch (err) {
+    feedbackWriteTotal.labels("error").inc();
+    featureErrorTotal.labels("feedback", "write_failed").inc();
+    return res.status(400).json({
+      ok: false,
+      ...meta,
+      version,
+      payload: null,
+      warnings,
+      errors: [err?.message || "feedback insert failed"],
+    });
+  }
+});
+
+router.get("/feedback", async (req, res) => {
+  const meta = responseMeta(req, null);
+  const startedAt = Date.now();
+  const version = featureVersionEnvelope({
+    featureName: "feedback",
+    featureVersion: "feedback-v1",
+    detModelVersion: DET_MODEL_VERSION,
+    thresholdVersion: THRESHOLD_VERSION,
+    algoHash: `dedupe:${FEEDBACK_DEDUPE_POLICY}`,
+  });
+  const warnings = [];
+  try {
+    const wellId = String(req.query.wellId || "").trim();
+    if (!wellId) {
+      feedbackReadTotal.labels("error", "list").inc();
+      featureErrorTotal.labels("feedback", "validation").inc();
+      return res.status(400).json({
+        ok: false,
+        ...meta,
+        version,
+        payload: null,
+        warnings,
+        errors: ["wellId is required"],
+      });
+    }
+    const rows = await listFeedback({
+      wellId,
+      fromDepth: req.query.from,
+      toDepth: req.query.to,
+      limit: req.query.limit,
+    });
+    feedbackReadTotal.labels("ok", "list").inc();
+    logger.info({
+      msg: "feature.complete",
+      feature: "feedback-list",
+      requestId: req.requestId || null,
+      wellId,
+      durationMs: Date.now() - startedAt,
+      status: 200,
+    });
+    const payload = {
+      wellId,
+      items: rows,
+      dedupePolicy: FEEDBACK_DEDUPE_POLICY,
+    };
+    return res.json({
+      ok: true,
+      ...meta,
+      ...payload,
+      version,
+      payload,
+      warnings,
+      errors: [],
+    });
+  } catch (err) {
+    feedbackReadTotal.labels("error", "list").inc();
+    featureErrorTotal.labels("feedback", "list_failed").inc();
+    return res.status(400).json({
+      ok: false,
+      ...meta,
+      version,
+      payload: null,
+      warnings,
+      errors: [err?.message || "feedback list failed"],
+    });
+  }
+});
+
+router.get("/feedback/summary", async (req, res) => {
+  const meta = responseMeta(req, null);
+  const startedAt = Date.now();
+  const version = featureVersionEnvelope({
+    featureName: "feedback",
+    featureVersion: "feedback-v1",
+    detModelVersion: DET_MODEL_VERSION,
+    thresholdVersion: THRESHOLD_VERSION,
+    algoHash: `dedupe:${FEEDBACK_DEDUPE_POLICY}`,
+  });
+  const warnings = [];
+  try {
+    const wellId = String(req.query.wellId || "").trim();
+    if (!wellId) {
+      feedbackReadTotal.labels("error", "summary").inc();
+      featureErrorTotal.labels("feedback", "validation").inc();
+      return res.status(400).json({
+        ok: false,
+        ...meta,
+        version,
+        payload: null,
+        warnings,
+        errors: ["wellId is required"],
+      });
+    }
+    const summary = await getFeedbackSummary({ wellId });
+    feedbackReadTotal.labels("ok", "summary").inc();
+    logger.info({
+      msg: "feature.complete",
+      feature: "feedback-summary",
+      requestId: req.requestId || null,
+      wellId,
+      durationMs: Date.now() - startedAt,
+      status: 200,
+    });
+    const payload = {
+      wellId,
+      summary,
+      dedupePolicy: FEEDBACK_DEDUPE_POLICY,
+    };
+    return res.json({
+      ok: true,
+      ...meta,
+      ...payload,
+      version,
+      payload,
+      warnings,
+      errors: [],
+    });
+  } catch (err) {
+    feedbackReadTotal.labels("error", "summary").inc();
+    featureErrorTotal.labels("feedback", "summary_failed").inc();
+    return res.status(400).json({
+      ok: false,
+      ...meta,
+      version,
+      payload: null,
+      warnings,
+      errors: [err?.message || "feedback summary failed"],
+    });
+  }
+});
 
 registerInterpretExportPdfRoute(router);
 registerCopilotHistoryRoutes(router, { listCopilotRuns, getCopilotRunById, pgPool });

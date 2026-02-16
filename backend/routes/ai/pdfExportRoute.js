@@ -98,6 +98,26 @@ function drawPageFooter(doc) {
   doc.page.margins.bottom = oldBottom;
 }
 
+function drawPageHeader(doc, meta = {}) {
+  const left = doc.page.margins.left;
+  const right = doc.page.width - doc.page.margins.right;
+  const y = 18;
+  doc.save();
+  doc.font("Helvetica-Bold").fontSize(8.8).fillColor("#334155").text("Interpretation Report", left, y, { width: 220 });
+  doc.font("Helvetica").fontSize(8.2).fillColor("#64748b").text(
+    `${safeText(meta?.wellId, "-")} | ${fmtInt(meta?.fromDepth)} -> ${fmtInt(meta?.toDepth)} ft`,
+    left + 165,
+    y,
+    { width: right - left - 165, align: "right" }
+  );
+  doc.moveTo(left, y + 12)
+    .lineTo(right, y + 12)
+    .lineWidth(0.7)
+    .strokeColor("#e2e8f0")
+    .stroke();
+  doc.restore();
+}
+
 function safeText(v, fallback = "-") {
   if (v === null || v === undefined) return fallback;
   if (typeof v === "string") return v.trim() || fallback;
@@ -341,6 +361,95 @@ function consolidateIntervals(intervals, gapTolerance = 8) {
   });
 }
 
+function drawIntervalsTable(doc, intervals = []) {
+  const rows = safeArray(intervals);
+  if (!rows.length) {
+    drawParagraphCard(doc, "Interval Findings", "No interval findings available.");
+    return;
+  }
+
+  const left = doc.page.margins.left;
+  const width = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const cols = [
+    { k: "idx", t: "#", w: 20, align: "right" },
+    { k: "curve", t: "Curve", w: 116 },
+    { k: "fromDepth", t: "From", w: 52, align: "right" },
+    { k: "toDepth", t: "To", w: 52, align: "right" },
+    { k: "priority", t: "Prio", w: 46 },
+    { k: "confidence", t: "Conf", w: 44, align: "right" },
+    { k: "reason", t: "Reason / Notes", w: width - 20 - 116 - 52 - 52 - 46 - 44 - 16 },
+  ];
+
+  const drawHeader = () => {
+    ensureSpace(doc, 30);
+    drawRoundedRect(doc, left, doc.y, width, 22, 5, "#eff6ff", "#bfdbfe");
+    const headerY = doc.y;
+    let x = left + 6;
+    cols.forEach((c) => {
+      doc.font("Helvetica-Bold").fontSize(8.1).fillColor("#1e3a8a").text(c.t, x, headerY + 7, {
+        width: c.w - 4,
+        align: c.align || "left",
+      });
+      x += c.w;
+    });
+    doc.y += 24;
+  };
+
+  drawHeader();
+  rows.forEach((r, idx) => {
+    const row = { ...r, idx: idx + 1 };
+    const reasonPreview = [
+      safeText(row.reason || "-", "-"),
+      safeText(row.probability ? `Prob: ${row.probability}` : "", ""),
+      safeText(row.stability ? `Stab: ${row.stability}` : "", ""),
+      safeText(row.explanation || "", ""),
+    ]
+      .filter(Boolean)
+      .join(" | ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const normalized = {
+      ...row,
+      fromDepth: fmtInt(row.fromDepth),
+      toDepth: fmtInt(row.toDepth),
+      confidence: fmt(row.confidence, 3, "-"),
+      reason: reasonPreview,
+    };
+
+    // rough row height based on reason content length.
+    doc.font("Helvetica").fontSize(8.5);
+    const reasonCol = cols[cols.length - 1];
+    const reasonH = doc.heightOfString(String(normalized.reason), { width: reasonCol.w - 4 });
+    const rowH = Math.max(20, reasonH + 6);
+    ensureSpace(doc, rowH + 4);
+    if (doc.y + rowH > doc.page.height - 50) {
+      doc.addPage();
+      drawHeader();
+    }
+
+    const bg = idx % 2 === 0 ? "#ffffff" : "#f8fafc";
+    const rowY = doc.y;
+    drawRoundedRect(doc, left, rowY, width, rowH, 4, bg, "#e2e8f0");
+    let x = left + 6;
+    cols.forEach((c) => {
+      const val = safeText(normalized[c.k], "-");
+      doc.font("Helvetica").fontSize(8.5).fillColor("#0f172a").text(val, x, rowY + 4, {
+        width: c.w - 4,
+        align: c.align || "left",
+      });
+      x += c.w;
+    });
+    doc.y += rowH + 3;
+  });
+}
+
+function removeTimeCurves(curves = []) {
+  return safeArray(curves).filter((c) => {
+    const t = String(c || "").trim().toUpperCase();
+    return t !== "TIME" && !t.startsWith("TIME__");
+  });
+}
+
 export function registerInterpretExportPdfRoute(router) {
   router.post("/interpret/export/pdf", async (req, res) => {
     let doc = null;
@@ -368,7 +477,9 @@ export function registerInterpretExportPdfRoute(router) {
       const recommendations = safeArray(narrative?.recommendations);
       const limitations = safeArray(narrative?.limitations);
       const summaryBullets = safeArray(narrative?.summary_bullets);
-      const curves = safeArray(payload?.curves).map((x) => safeText(x, "")).filter(Boolean);
+      const curves = removeTimeCurves(
+        safeArray(payload?.curves).map((x) => safeText(x, "")).filter(Boolean)
+      );
       const rawJson = JSON.stringify(payload ?? {}, null, 2);
 
       const filename = `interpretation_report_${wellId}_${Date.now()}.pdf`;
@@ -402,6 +513,8 @@ export function registerInterpretExportPdfRoute(router) {
       });
 
       doc.pipe(res);
+      doc.on("pageAdded", () => drawPageHeader(doc, { wellId, fromDepth, toDepth }));
+      drawPageHeader(doc, { wellId, fromDepth, toDepth });
 
       drawCover(doc, {
         wellId,
@@ -446,17 +559,7 @@ export function registerInterpretExportPdfRoute(router) {
       );
 
       drawSectionTitle(doc, "Interval Findings");
-      if (!intervals.length) {
-        drawParagraphCard(doc, "Interval Findings", "No interval findings available.");
-      } else {
-        intervals.forEach((it, idx) => {
-          const line1 = `${idx + 1}. ${safeText(it.curve)} | ${fmtInt(it.fromDepth)} -> ${fmtInt(it.toDepth)} ft`;
-          const line2 = `Priority: ${safeText(it.priority)} | Probability: ${safeText(it.probability)} | Stability: ${safeText(it.stability)} | Confidence: ${fmt(it.confidence, 3)}`;
-          const notes = [safeText(it.reason, ""), safeText(it.explanation, "")].filter(Boolean).join(" ");
-          const content = notes ? `${line2}\n${notes}` : line2;
-          drawParagraphCard(doc, line1, content, { fontSize: 9.7 });
-        });
-      }
+      drawIntervalsTable(doc, intervals);
 
       drawSectionTitle(doc, "Consolidated Intervals (Composite)");
       if (!consolidated.length) {

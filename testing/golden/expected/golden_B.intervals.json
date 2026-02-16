@@ -1,0 +1,11 @@
+[
+  {
+    "curve": "HC1__2",
+    "fromDepth": 1100,
+    "toDepth": 1112,
+    "reason": "noisy_zone",
+    "score": 18,
+    "curvesSupporting": 1,
+    "evidenceType": "single-curve"
+  }
+]

@@ -37,35 +37,96 @@ def build_insight(
     wh = float(np.clip(0.45 * anomaly_score + 0.35 * (max(corr12, 0.0)) + 0.20 * severity_conf, 0.0, 1.0))
     ch = float(np.clip(abs(slope2) / (abs(slope1) + EPS), 0.0, 5.0)) if (arr1.size and arr2.size) else None
 
-    def wh_text(v):
+    def wh_text(v, corr, sev):
+        sev_txt = str(sev or "UNKNOWN").upper()
+        corr_txt = f"corr={corr:.2f}" if np.isfinite(corr) else "corr=n/a"
         if v >= 0.75:
-            return "high likelihood of hydrocarbon-related activity"
+            return f"high hydrocarbon indication ({corr_txt}, severity={sev_txt})"
         if v >= 0.50:
-            return "moderate hydrocarbon indication"
-        return "low-to-moderate hydrocarbon indication"
+            return f"moderate hydrocarbon indication ({corr_txt}, severity={sev_txt})"
+        return f"low-to-moderate hydrocarbon indication ({corr_txt}, severity={sev_txt})"
 
-    def bh_text(v):
+    def _curve_domain_hint(curve1, curve2):
+        pair = f"{str(curve1 or '').upper()}|{str(curve2 or '').upper()}"
+        if "N_ATM" in pair or "O_ATM" in pair or "ATM" in pair:
+            return "Likely atmospheric/background influence; check QC."
+        if "CO2" in pair:
+            return "May reflect gas-composition change; cross-check nearby curves."
+        return "Cross-check with nearby curves and depth trend."
+
+    def bh_text(v, curve1, curve2, m1, m2):
         if v is None or not np.isfinite(v):
             return "insufficient curve pair for balance ratio"
+        c1_name = curve1 or "curve-1"
+        c2_name = curve2 or "curve-2"
+        left = f"{c1_name} mean={m1:.3f}" if np.isfinite(m1) else f"{c1_name} mean=n/a"
+        right = f"{c2_name} mean={m2:.3f}" if np.isfinite(m2) else f"{c2_name} mean=n/a"
+        hint = _curve_domain_hint(c1_name, c2_name)
         if 0.8 <= v <= 1.25:
-            return "balanced response between selected curves"
+            return f"Balanced response ({left}, {right}); no clear dominance. {hint}"
         if v > 1.25:
-            return "first selected curve dominates"
-        return "second selected curve dominates"
+            return f"{c1_name} dominates ({left} vs {right}); possible compositional skew. {hint}"
+        return f"{c2_name} dominates ({right} vs {left}); possible compositional skew. {hint}"
 
-    def ch_text(v):
+    def _trend_dir(s):
+        if not np.isfinite(s):
+            return "insufficient trend"
+        if s > 0:
+            return "increasing"
+        if s < 0:
+            return "decreasing"
+        return "stable"
+
+    def _corr_label(c):
+        if not np.isfinite(c):
+            return "correlation unavailable"
+        a = abs(c)
+        if a >= 0.7:
+            return "strong correlation"
+        if a >= 0.4:
+            return "moderate correlation"
+        return "weak correlation"
+
+    def ch_text(v, s1, s2, corr, curve1, curve2):
         if v is None or not np.isfinite(v):
             return "insufficient data for character ratio"
-        if v >= 1.25:
-            return "deeper interval trend strength is relatively higher in curve-2"
-        if v >= 0.75:
-            return "both selected curves show comparable trend strength"
-        return "curve-1 trend dominates"
+
+        c1_name = curve1 or "curve-1"
+        c2_name = curve2 or "curve-2"
+        d1 = _trend_dir(s1)
+        d2 = _trend_dir(s2)
+        corr_text = _corr_label(corr)
+        hint = _curve_domain_hint(c1_name, c2_name)
+
+        if v >= 1.6:
+            return (
+                f"{c2_name} trend dominates ({d2}) versus {c1_name} ({d1}); "
+                f"{corr_text}; {c2_name}-driven character with depth. {hint}"
+            )
+        if v >= 1.15:
+            return (
+                f"{c2_name} shows moderately stronger trend behavior than {c1_name}; "
+                f"{corr_text}; moderate shift toward {c2_name}. {hint}"
+            )
+        if v >= 0.85:
+            return (
+                f"{c1_name} and {c2_name} show comparable trend strength "
+                f"({d1}/{d2}) with {corr_text}; mixed character response."
+            )
+        if v >= 0.55:
+            return (
+                f"{c1_name} trend is moderately stronger than {c2_name} "
+                f"({d1} vs {d2}); {corr_text}; moderate shift toward {c1_name}. {hint}"
+            )
+        return (
+            f"{c1_name} trend dominates ({d1}) while {c2_name} is {d2}; "
+            f"{corr_text}; {c1_name}-controlled character. {hint}"
+        )
 
     fluid = "Uncertain"
     fluid_conf = float(np.clip(0.45 * severity_conf + 0.30 * max(corr12, 0.0) + 0.25 * anomaly_score, 0.0, 1.0))
     if fluid_conf >= 0.72 and corr12 >= 0.5:
-        fluid = "Oil-prone (inferred)"
+        fluid = "Oil or gas (inferred)"
     elif fluid_conf >= 0.58:
         fluid = "Mixed hydrocarbon signal"
     elif anomaly_score >= 0.22:
@@ -81,10 +142,22 @@ def build_insight(
         evidence.append(f"{c1}-{c2} correlation r={corr12:.3f}")
     evidence.append(f"Anomaly score={anomaly_score:.3f}, severity confidence={severity_conf:.3f}")
 
+    def _friendly_reason(reason: str, curve: str) -> str:
+        r = str(reason or "").strip().lower()
+        c = str(curve or "").strip()
+        if r == "noisy_zone":
+            return f"Rapid local variation in {c or 'selected curves'} suggests a potentially active hydrocarbon interval."
+        if r == "step_change":
+            return f"Step-like shift in {c or 'selected curves'} indicates a possible fluid transition zone."
+        if r == "spike":
+            return f"Sharp excursion in {c or 'selected curves'} suggests a localized hydrocarbon show."
+        return f"Anomalous behavior in {c or 'selected curves'} suggests interval-level hydrocarbon response."
+
     shows = []
     for f in findings[:6]:
         p = f.get("probability", probability_bucket(f.get("score", 0.0), f.get("confidence", 0.0)))
-        reason = f"{f.get('reason','anomaly')} | score={f.get('score','-')} | priority={f.get('priority','watch')}"
+        curve_name = str(f.get("curve", "")).strip()
+        reason = _friendly_reason(str(f.get("reason", "anomaly")), curve_name)
         shows.append(
             {
                 "fromDepth": f["fromDepth"],
@@ -92,6 +165,8 @@ def build_insight(
                 "probability": p,
                 "reason": reason,
                 "stability": f.get("stability", "unknown"),
+                "score": f.get("score"),
+                "priority": f.get("priority"),
             }
         )
 
@@ -124,11 +199,11 @@ def build_insight(
             local_anom = overlaps / max(1, len(findings))
 
         if local_anom >= 0.6:
-            label = "High activity zone"
+            label = "High hydrocarbon potential"
         elif local_anom >= 0.3:
-            label = "Transitional zone"
+            label = "Moderate hydrocarbon potential"
         else:
-            label = "Relatively stable zone"
+            label = "Low hydrocarbon potential"
 
         notes = []
         if c1 and len(local_vals) > 0 and np.isfinite(local_vals[0]):
@@ -148,10 +223,18 @@ def build_insight(
             }
         )
 
+    strongest = findings[0] if findings else None
+    if strongest:
+        strongest_txt = (
+            f"Strongest interval is {float(strongest['fromDepth']):.0f}-{float(strongest['toDepth']):.0f} ft"
+        )
+    else:
+        strongest_txt = "No strong localized interval was detected"
+
     summary_para = (
-        f"For well {well_id}, interval {from_depth:.3f}–{to_depth:.3f} was analyzed across "
-        f"{len(curves)} selected curve(s). Global risk is {severity_band}, with {len(findings)} key event(s) "
-        f"and detection confidence {detection_conf:.3f}. Signals suggest {fluid.lower()}."
+        f"Interval {from_depth:.3f}-{to_depth:.3f} was analyzed across {len(curves)} selected curve(s). "
+        f"{strongest_txt}. Global risk is {severity_band} with detection confidence {detection_conf:.3f}. "
+        f"Overall fluid tendency suggests {fluid.lower()}."
     )
 
     return {
@@ -163,9 +246,9 @@ def build_insight(
             "wetnessIndexWh": round(wh, 3),
             "balanceRatioBh": (round(float(bh), 3) if bh is not None and np.isfinite(bh) else None),
             "characterRatioCh": (round(float(ch), 3) if ch is not None and np.isfinite(ch) else None),
-            "wetnessText": wh_text(wh),
-            "balanceText": bh_text(bh),
-            "characterText": ch_text(ch),
+            "wetnessText": wh_text(wh, corr12, severity_band),
+            "balanceText": bh_text(bh, c1, c2, mean1, mean2),
+            "characterText": ch_text(ch, slope1, slope2, corr12, c1, c2),
         },
         "primaryFluid": {
             "label": fluid,

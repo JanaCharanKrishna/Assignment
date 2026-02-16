@@ -1,5 +1,4 @@
 // backend/services/pyCopilotClient.js
-import axios from "axios";
 
 const PY_AI_BASE = (process.env.PY_AI_BASE || "http://127.0.0.1:8000").replace(/\/+$/, "");
 const PY_COPILOT_TIMEOUT_MS = Number(process.env.PY_COPILOT_TIMEOUT_MS || 45000);
@@ -12,9 +11,9 @@ const PY_COPILOT_TIMEOUT_MS = Number(process.env.PY_COPILOT_TIMEOUT_MS || 45000)
 
 
 export async function callPythonCopilot(payload) {
-  const base = process.env.PY_AI_BASE || "http://127.0.0.1:8000";
-  const url = `${base}/copilot/query`; // adjust if your python path differs
-  const t0 = Date.now();
+  const url = `${PY_AI_BASE}/copilot/query`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PY_COPILOT_TIMEOUT_MS);
 
   let res;
   let text = "";
@@ -23,10 +22,16 @@ export async function callPythonCopilot(payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: ctrl.signal,
     });
     text = await res.text();
   } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error(`python_timeout_after_${PY_COPILOT_TIMEOUT_MS}ms`);
+    }
     throw new Error(`python_network_error: ${e?.message || e}`);
+  } finally {
+    clearTimeout(timer);
   }
 
   let json = null;

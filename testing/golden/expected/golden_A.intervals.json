@@ -1,0 +1,11 @@
+[
+  {
+    "curve": "HC1__2,HC2__3",
+    "fromDepth": 1100,
+    "toDepth": 1110,
+    "reason": "spike",
+    "score": 20,
+    "curvesSupporting": 2,
+    "evidenceType": "multi-curve"
+  }
+]

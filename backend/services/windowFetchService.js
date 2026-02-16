@@ -8,6 +8,7 @@ import {
 import { chooseLevel, choosePointBudget } from "./windowLevelSelector.js";
 import { downsampleMinmax } from "./windowDownsample.js";
 import { getOrBuildTileWithLock } from "./windowTileLock.js";
+import { cacheTileRequests } from "../observability/metrics.js";
 
 function cropRows(rows, fromDepth, toDepth) {
   const lo = Math.min(Number(fromDepth), Number(toDepth));
@@ -114,6 +115,7 @@ async function fetchWindowData({
     let tileRows = [];
     if (raw) {
       hit += 1;
+      cacheTileRequests.labels("hit").inc();
       try {
         tileRows = JSON.parse(raw)?.rows || [];
       } catch {
@@ -121,6 +123,7 @@ async function fetchWindowData({
       }
     } else {
       miss += 1;
+      cacheTileRequests.labels("miss").inc();
       const built = await getOrBuildTileWithLock(
         redisClient,
         k,

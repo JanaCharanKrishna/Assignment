@@ -26,12 +26,18 @@ pnpm-debug.log*
 dist/
 build/
 coverage/
+.next/
+.turbo/
+playwright-report/
+test-results/
 
 # Runtime/temp
 *.log
 tmp/
 temp/
 uploads/
+*.pid
+*.seed
 
 # Local caches
 .cache/

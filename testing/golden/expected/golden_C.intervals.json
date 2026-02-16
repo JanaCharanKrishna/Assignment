@@ -1,0 +1,11 @@
+[
+  {
+    "curve": "CC6",
+    "fromDepth": 12428,
+    "toDepth": 13334,
+    "reason": "baseline_ok",
+    "score": 1,
+    "curvesSupporting": 1,
+    "evidenceType": "single-curve"
+  }
+]
