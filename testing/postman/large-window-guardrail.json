@@ -1,0 +1,29 @@
+{
+  "first": {
+    "status": 200,
+    "ok": true,
+    "source": "mixed",
+    "completeness": "partial",
+    "levelUsed": 0,
+    "tiles": {
+      "total": 40,
+      "hit": 7,
+      "miss": 33
+    },
+    "pointsReturned": 8001,
+    "underMax12000": true,
+    "sorted": true,
+    "noDuplicateDepths": true,
+    "minDepth": 9000,
+    "maxDepth": 17000
+  },
+  "second": {
+    "status": 200,
+    "ok": true,
+    "source": "redis",
+    "completeness": "complete",
+    "hit": 40,
+    "miss": 0,
+    "pointsReturned": 8001
+  }
+}

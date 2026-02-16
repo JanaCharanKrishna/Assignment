@@ -6,9 +6,9 @@ import {
   insertInterpretationRun,
   getInterpretationRunById,
   listInterpretationRuns,
+  deleteInterpretationRunById,
 } from "../repositories/interpretationRunsRepo.js";
 import { jsonrepair } from "jsonrepair";
-import PDFDocument from "pdfkit";
 import {
   insertCopilotRun,
   listCopilotRuns,
@@ -20,9 +20,26 @@ import {
   buildPlaybookSnippets,
   evidenceSufficiency,
   computeCompareMetrics,
-  buildFallbackJson
+  buildFallbackJson,
+  tagIntervalsWithEvidenceType,
+  applyQualityGatesToIntervals,
+  enforceMultiCurveInTop,
 } from "../services/copilotEngine.js";
+import {
+  fetchRowsForRangeDB,
+  buildBaselineContext,
+  loadThresholds,
+} from "../services/baselineEngine.js";
+import {
+  classifyQuestionIntent,
+  validateAgainstContext,
+} from "../services/guardEngine.js";
+import { applyQualityGates } from "../services/qualityGates.js";
+import { applyBaselineAwareScoring } from "../services/baselineScoring.js";
+import { consolidateMultiCurveIntervals } from "../services/multiCurveConsolidation.js";
 import { validateCopilotResponse } from "../services/copilotSchema.js";
+import { registerInterpretExportPdfRoute } from "./ai/pdfExportRoute.js";
+import { registerCopilotHistoryRoutes } from "./ai/copilotHistoryRoutes.js";
 
 const router = express.Router();
 
@@ -35,23 +52,13 @@ const PY_COPILOT_TIMEOUT_MS = Number(process.env.PY_COPILOT_TIMEOUT_MS || 45000)
 
 const API_BASE = process.env.API_BASE || "http://localhost:5000";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const WELL_API_TIMEOUT_MS = timeoutMsFromEnv("WELL_API_TIMEOUT_MS", 20000);
+const GROQ_TIMEOUT_MS = timeoutMsFromEnv("GROQ_TIMEOUT_MS", 18000);
+const DB_WRITE_TIMEOUT_MS = timeoutMsFromEnv("DB_WRITE_TIMEOUT_MS", 6000);
 const GROQ_MODEL =
   process.env.GROQ_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
 
 /** ---------- helpers ---------- **/
-
-
-
-
-
-function fmt(v, digits = 1, fallback = "n/a") {
-  const n = safeNum(v, null);
-  if (n === null) return fallback;
-  return n.toFixed(safeDigits(digits, 1));
-}
-
-
-
 
 
 
@@ -83,6 +90,15 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 45000) {
   }
 }
 
+function withTimeout(promise, timeoutMs, label = "operation") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
+}
+
 
 
 async function computeDeterministicForRange({ wellId, range, curves }) {
@@ -112,129 +128,14 @@ async function computeDeterministicForRange({ wellId, range, curves }) {
 
 
 
-function riskMeta(risk) {
-  const x = String(risk || "").toLowerCase();
-  if (x.includes("critical")) return { label: "CRITICAL", color: "#991b1b", bg: "#fef2f2", border: "#fecaca" };
-  if (x.includes("high")) return { label: "HIGH", color: "#9a3412", bg: "#fff7ed", border: "#fed7aa" };
-  if (x.includes("moderate") || x.includes("med")) return { label: "MODERATE", color: "#92400e", bg: "#fffbeb", border: "#fde68a" };
-  if (x.includes("low")) return { label: "LOW", color: "#065f46", bg: "#ecfdf5", border: "#a7f3d0" };
-  return { label: String(risk || "UNKNOWN").toUpperCase(), color: "#1f2937", bg: "#f9fafb", border: "#e5e7eb" };
-}
-function drawRoundedRect(doc, x, y, w, h, r = 6, fill = null, stroke = null) {
-  doc.save();
-  if (fill) doc.fillColor(fill);
-  if (stroke) doc.strokeColor(stroke);
-  doc.roundedRect(x, y, w, h, r);
-  if (fill && stroke) doc.fillAndStroke();
-  else if (fill) doc.fill();
-  else if (stroke) doc.stroke();
-  doc.restore();
-}
-function drawSectionTitle(doc, title) {
-  doc.moveDown(0.8);
-  doc.font("Helvetica-Bold").fontSize(13).fillColor("#111827").text(title);
-  doc.moveDown(0.25);
-}
-function ensureSpace(doc, needed = 80, top = 40, bottom = 45) {
-  const pageBottom = doc.page.height - bottom;
-  if (doc.y + needed > pageBottom) {
-    doc.addPage();
-    doc.y = top;
-  }
-}
-function drawPageFooter(doc) {
-  const oldBottom = doc.page.margins.bottom;
-  doc.page.margins.bottom = 0;
-  const y = doc.page.height - 24;
-  doc.fontSize(8).fillColor("#6b7280").text(`Page ${doc.page.number}`, 0, y, { align: "center" });
-  doc.page.margins.bottom = oldBottom;
-}
-
-function normalizeIntervals(narrativeIntervals, deterministicIntervals) {
-  const arr = safeArray(narrativeIntervals).length
-    ? safeArray(narrativeIntervals)
-    : safeArray(deterministicIntervals);
-
-  return arr.map((it, idx) => ({
-    idx: idx + 1,
-    curve: String(it?.curve || "-"),
-    fromDepth: toNum(it?.fromDepth),
-    toDepth: toNum(it?.toDepth),
-    priority: String(it?.priority || "-"),
-    probability: String(it?.probability || "-"),
-    stability: String(it?.stability || "-"),
-    stabilityScore: toNum(it?.stabilityScore),
-    confidence: toNum(it?.confidence),
-    reason: String(it?.reason || ""),
-    explanation: String(it?.explanation || ""),
-    agreement: toNum(it?.agreement),
-    width: toNum(it?.width),
-  }));
-}
-
-function consolidateIntervals(intervals, gapTolerance = 8) {
-  const valid = intervals
-    .filter((x) => Number.isFinite(x.fromDepth) && Number.isFinite(x.toDepth))
-    .map((x) => ({
-      ...x,
-      fromDepth: Math.min(x.fromDepth, x.toDepth),
-      toDepth: Math.max(x.fromDepth, x.toDepth),
-    }))
-    .sort((a, b) => a.fromDepth - b.fromDepth);
-
-  if (!valid.length) return [];
-
-  const groups = [];
-  let current = [valid[0]];
-  for (let i = 1; i < valid.length; i++) {
-    const prev = current[current.length - 1];
-    const next = valid[i];
-    if (next.fromDepth <= prev.toDepth + gapTolerance) current.push(next);
-    else {
-      groups.push(current);
-      current = [next];
-    }
-  }
-  groups.push(current);
-
-  return groups.map((g, idx) => {
-    const fromDepth = Math.min(...g.map((x) => x.fromDepth));
-    const toDepth = Math.max(...g.map((x) => x.toDepth));
-    const curves = [...new Set(g.map((x) => x.curve).filter(Boolean))];
-    const priorities = [...new Set(g.map((x) => x.priority).filter(Boolean))];
-    const probs = [...new Set(g.map((x) => x.probability).filter(Boolean))];
-    const stabilities = [...new Set(g.map((x) => x.stability).filter(Boolean))];
-    const confs = g.map((x) => x.confidence).filter(Number.isFinite);
-    const avgConfidence = confs.length ? confs.reduce((a, b) => a + b, 0) / confs.length : null;
-
-    return {
-      compositeId: idx + 1,
-      fromDepth,
-      toDepth,
-      width: toDepth - fromDepth,
-      intervalCount: g.length,
-      curves: curves.join(", "),
-      dominantPriority: priorities[0] || "-",
-      probabilityMix: probs.join(", ") || "-",
-      stabilityMix: stabilities.join(", ") || "-",
-      avgConfidence,
-    };
-  });
-}
-
 async function safeJson(url, opts = {}) {
-  const res = await fetch(url, opts);
-  const text = await res.text();
-
-  let json = {};
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`Non-JSON from ${url}: ${text.slice(0, 220)}`);
+  const out = await fetchJsonWithTimeout(url, opts, WELL_API_TIMEOUT_MS);
+  const json = out?.json;
+  if (!out?.ok) {
+    throw new Error(json?.error || `Request failed (${out?.status || "unknown"})`);
   }
-
-  if (!res.ok) {
-    throw new Error(json?.error || `Request failed (${res.status})`);
+  if (!json || typeof json !== "object") {
+    throw new Error(`Non-JSON from ${url}: ${(out?.text || "").slice(0, 220)}`);
   }
   return json;
 }
@@ -265,9 +166,12 @@ function detFindingToNarrativeInterval(f) {
     stabilityScore: f?.stabilityScore ?? null,
     agreement: f?.agreement ?? null,
     width: f?.width ?? null,
+    evidenceType: f?.evidenceType ?? null,
     curvesSupporting: f?.curvesSupporting ?? null,
     reason,
     score: score ?? null,
+    score2: f?.score2 ?? null,
+    baseline: f?.baseline ?? null,
   };
 }
 
@@ -809,29 +713,25 @@ Rules:
   };
 
   try {
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${GROQ_API_KEY}`,
+    const out = await fetchJsonWithTimeout(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    });
+      GROQ_TIMEOUT_MS
+    );
+    const envelope = out?.json || null;
 
-    const txt = await res.text();
-
-    let envelope;
-    try {
-      envelope = JSON.parse(txt);
-    } catch {
-      throw new Error("groq_envelope_non_json");
-    }
-
-    if (!res.ok) {
+    if (!out?.ok) {
       const msg =
         envelope?.error?.message ||
         envelope?.error ||
-        `Groq failed (${res.status})`;
+        `Groq failed (${out?.status || "unknown"})`;
       throw new Error(`groq_http_error:${msg}`);
     }
 
@@ -978,19 +878,47 @@ router.post("/interpret", async (req, res) => {
       wellId,
     });
 
-    const runRecord = await insertInterpretationRun({
-      wellId,
-      fromDepth: lo,
-      toDepth: hi,
+    const qg = applyQualityGates({
+      rows,
       curves,
       deterministic,
-      insight,
-      narrative: nar.narrative,
-      modelUsed: nar.modelUsed,
-      narrativeStatus: nar.narrativeStatus,
-      source: "fresh",
-      appVersion: process.env.APP_VERSION || null,
+      narrative: nar?.narrative || {},
     });
+    const deterministic2 = qg.deterministic;
+    const narrative2 = qg.narrative;
+
+    const deterministic3 = applyBaselineAwareScoring({
+      rows,
+      curves,
+      deterministic: deterministic2,
+    });
+
+    const deterministic4 = consolidateMultiCurveIntervals(deterministic3);
+    const deterministic5 = normalizeIntervalSupport(deterministic4);
+    const narrative3 = syncNarrativeWithDeterministic(narrative2, deterministic5);
+
+    let runRecord = null;
+    try {
+      runRecord = await withTimeout(
+        insertInterpretationRun({
+          wellId,
+          fromDepth: lo,
+          toDepth: hi,
+          curves,
+          deterministic: deterministic5,
+          insight,
+          narrative: narrative3,
+          modelUsed: nar.modelUsed,
+          narrativeStatus: nar.narrativeStatus,
+          source: "fresh",
+          appVersion: process.env.APP_VERSION || null,
+        }),
+        DB_WRITE_TIMEOUT_MS,
+        "insertInterpretationRun"
+      );
+    } catch (dbErr) {
+      console.warn("[interpret] non-blocking DB write failure:", dbErr?.message || dbErr);
+    }
 
     return res.json({
       ok: true,
@@ -1000,9 +928,9 @@ router.post("/interpret", async (req, res) => {
       well: { wellId, name: wellId },
       range: { fromDepth: lo, toDepth: hi },
       curves,
-      deterministic,
+      deterministic: deterministic5,
       insight,
-      narrative: nar.narrative,
+      narrative: narrative3,
       modelUsed: nar.modelUsed,
       narrativeStatus: nar.narrativeStatus,
       generatedAt: new Date().toISOString(),
@@ -1055,6 +983,18 @@ router.get("/runs/:runId", async (req, res) => {
   } catch (err) {
     console.error("GET /api/ai/runs/:runId failed:", err);
     return res.status(500).json({ error: err?.message || "Failed to fetch run" });
+  }
+});
+
+router.delete("/runs/:runId", async (req, res) => {
+  try {
+    const { runId } = req.params;
+    const deleted = await deleteInterpretationRunById(runId);
+    if (!deleted) return res.status(404).json({ error: "Run not found" });
+    return res.json({ ok: true, runId: deleted.run_id ?? deleted.runId ?? runId });
+  } catch (err) {
+    console.error("DELETE /api/ai/runs/:runId failed:", err);
+    return res.status(500).json({ error: err?.message || "Failed to delete run" });
   }
 });
 
@@ -1126,6 +1066,67 @@ function fmtNum(v, digits = 1, fallback = "n/a") {
   return n.toFixed(safeDigits(digits, 1));
 }
 
+function extractDepthFromQuestion(question = "") {
+  const q = asStr(question, "");
+  const m = q.match(/\b(\d{3,6}(?:\.\d+)?)\b/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function hasCurveInContext(curveToken, curves) {
+  const token = asStr(curveToken, "").toLowerCase();
+  if (!token) return false;
+  return toArr(curves).some((c) => asStr(c, "").toLowerCase() === token);
+}
+
+function findRequestedCurveToken(question = "", curves = []) {
+  const available = new Set(toArr(curves).map((c) => asStr(c, "").toLowerCase()));
+  if (!available.size) return null;
+
+  const tokens = asStr(question, "")
+    .split(/[^A-Za-z0-9_]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  for (const t of tokens) {
+    if (available.has(t.toLowerCase())) return t;
+  }
+  return null;
+}
+
+function probeDepthValue(rows, askedDepth, requestedCurve, curves = []) {
+  const ad = Number(askedDepth);
+  if (!Array.isArray(rows) || !rows.length || !Number.isFinite(ad)) return null;
+
+  let nearest = null;
+  let bestDist = Infinity;
+  for (const r of rows) {
+    const d = Number(r?.depth);
+    if (!Number.isFinite(d)) continue;
+    const dist = Math.abs(d - ad);
+    if (dist < bestDist) {
+      bestDist = dist;
+      nearest = r;
+    }
+  }
+  if (!nearest) return null;
+
+  const candidates = [];
+  if (requestedCurve) candidates.push(requestedCurve);
+  candidates.push(...toArr(curves));
+
+  for (const c of candidates) {
+    const key = asStr(c, "");
+    if (!key) continue;
+    const v = Number(nearest?.values?.[key] ?? nearest?.[key]);
+    if (Number.isFinite(v)) {
+      return { depth: Number(nearest.depth), curve: key, value: v };
+    }
+  }
+
+  return null;
+}
+
 
 
 
@@ -1181,6 +1182,68 @@ router.post("/copilot/query", async (req, res) => {
       playbook_snippets: buildPlaybookSnippets(mode),
     };
 
+    const thresholds = loadThresholds();
+    const baselineWindowFt = Number(
+      thresholds?.baseline?.windowPadFt ?? thresholds?.baseline?.windowFt ?? 1500
+    );
+
+    let localRows = [];
+    let baselineRows = [];
+    if (
+      wellId &&
+      Number.isFinite(fromDepth) &&
+      Number.isFinite(toDepth) &&
+      curves.length > 0
+    ) {
+      try {
+        localRows = await fetchRowsForRangeDB({
+          wellId,
+          fromDepth,
+          toDepth,
+          curves,
+          limit: 30000,
+        });
+
+        baselineRows = await fetchRowsForRangeDB({
+          wellId,
+          fromDepth: fromDepth - baselineWindowFt,
+          toDepth: toDepth + baselineWindowFt,
+          curves,
+          limit: 60000,
+        });
+      } catch (e) {
+        console.warn("[copilot] baseline fetch failed:", e?.message || e);
+      }
+    }
+
+    const baselineContext = buildBaselineContext({
+      baselineRows,
+      localRows,
+      curves,
+      thresholds,
+    });
+    evidence.baseline = baselineContext;
+
+    const originalIntervals = safeArr(evidence?.narrative?.interval_explanations);
+    const taggedIntervals = tagIntervalsWithEvidenceType(originalIntervals, thresholds);
+    const gated = applyQualityGatesToIntervals(taggedIntervals, baselineContext, thresholds);
+    const topN = Number(thresholds?.interval?.topN ?? 10);
+    const minMultiInTop = Number(
+      thresholds?.interval?.enforceMinMultiCurve ?? thresholds?.interval?.minMultiInTop ?? 2
+    );
+    const topIntervals = enforceMultiCurveInTop(gated.intervals, topN, minMultiInTop);
+    const topSet = new Set(topIntervals);
+    const others = gated.intervals.filter((x) => !topSet.has(x));
+    evidence.narrative.interval_explanations = [...topIntervals, ...others];
+    if (gated.limitations.length) {
+      evidence.narrative.limitations = [
+        ...new Set([
+          ...safeArr(evidence?.narrative?.limitations),
+          ...gated.limitations,
+        ]),
+      ];
+    }
+
     // Evidence gate - allow depth query with deterministic even if narrative is thin
     const gate = evidenceSufficiency(evidence);
     const depthQ = isDepthQuery(question);
@@ -1228,6 +1291,130 @@ router.post("/copilot/query", async (req, res) => {
       return res.json(responsePayload);
     }
 
+    const intent = classifyQuestionIntent(question);
+    const guard = validateAgainstContext({
+      intent,
+      availableCurves: curves,
+      fromDepth,
+      toDepth,
+    });
+
+    if (!guard.ok) {
+      const fallback = buildFallbackJson({ mode, evidence, compare: { summary: "", delta_metrics: [] } });
+
+      if (guard.reason === "missing_curve") {
+        fallback.answer_title = "Requested curve not in current context";
+        fallback.direct_answer = `I cannot find ${guard.missingCurves.join(", ")} in selected curves.`;
+        fallback.key_points = [
+          `Available curves: ${curves.join(", ") || "none"}`,
+          `Well: ${wellId || "UNKNOWN_WELL"}`,
+          `Range: ${fmtNum(fromDepth, 1)}-${fmtNum(toDepth, 1)} ft`,
+        ];
+      } else if (guard.reason === "depth_out_of_range") {
+        fallback.answer_title = "Requested depth is outside current interval";
+        fallback.direct_answer = `Asked depth is outside ${fmtNum(fromDepth, 1)}-${fmtNum(toDepth, 1)} ft.`;
+        fallback.key_points = [
+          `Well: ${wellId || "UNKNOWN_WELL"}`,
+          `Current range: ${fmtNum(fromDepth, 1)}-${fmtNum(toDepth, 1)} ft`,
+        ];
+      }
+
+      const patched = patchDirectAnswerFromEvidence(fallback, evidence, question);
+      const responsePayload = {
+        ok: true,
+        source: "grounded_guard",
+        schema_valid: true,
+        evidence_strength: "medium",
+        json: patched,
+        evidence,
+        llm_error: null,
+        latency_ms: Date.now() - startedAt,
+      };
+      try {
+        await insertCopilotRunRow({
+          source: "grounded_guard",
+          llmUsed: false,
+          schemaValid: true,
+          modelName: null,
+          latencyMs: responsePayload.latency_ms,
+          llmError: null,
+          question,
+          mode,
+          wellId: evidence.context_meta.wellId,
+          fromDepth,
+          toDepth,
+          curves,
+          responseJson: patched,
+          evidenceJson: evidence,
+          schemaErrors: [],
+        });
+      } catch (dbErr) {
+        console.warn("[copilot] DB insert failed:", dbErr?.message || dbErr);
+      }
+      return res.json(responsePayload);
+    }
+
+    if (
+      (intent.kind === "depth" || intent.kind === "curve_depth") &&
+      Number.isFinite(Number(intent.askedDepth))
+    ) {
+      const requestedCurve = Array.isArray(intent.askedCurves) && intent.askedCurves.length
+        ? intent.askedCurves[0]
+        : findRequestedCurveToken(question, curves);
+      const probe = probeDepthValue(localRows, Number(intent.askedDepth), requestedCurve, curves);
+      if (probe) {
+        const fallback = buildFallbackJson({ mode, evidence, compare: { summary: "", delta_metrics: [] } });
+        fallback.answer_title = `Depth Probe ${fmtNum(intent.askedDepth, 1)} ft`;
+        fallback.direct_answer = `At ${fmtNum(intent.askedDepth, 1)} ft, nearest sampled depth is ${fmtNum(probe.depth, 1)} ft. ${probe.curve}: ${fmtNum(probe.value, 4)}.`;
+        fallback.key_points = [
+          `Depth requested: ${fmtNum(intent.askedDepth, 1)} ft`,
+          `Nearest sampled depth: ${fmtNum(probe.depth, 1)} ft`,
+          `Curve: ${probe.curve}`,
+          `Value: ${fmtNum(probe.value, 4)}`,
+        ];
+        fallback.evidence_used = [
+          {
+            source: "depth_probe",
+            confidence: "high",
+            snippet: `depth=${fmtNum(probe.depth, 1)}, curve=${probe.curve}, value=${fmtNum(probe.value, 4)}`,
+          },
+        ];
+        const patched = patchDirectAnswerFromEvidence(fallback, evidence, question);
+        const responsePayload = {
+          ok: true,
+          source: "grounded_guard",
+          schema_valid: true,
+          evidence_strength: "high",
+          json: patched,
+          evidence,
+          llm_error: null,
+          latency_ms: Date.now() - startedAt,
+        };
+        try {
+          await insertCopilotRunRow({
+            source: "grounded_guard",
+            llmUsed: false,
+            schemaValid: true,
+            modelName: null,
+            latencyMs: responsePayload.latency_ms,
+            llmError: null,
+            question,
+            mode,
+            wellId: evidence.context_meta.wellId,
+            fromDepth,
+            toDepth,
+            curves,
+            responseJson: patched,
+            evidenceJson: evidence,
+            schemaErrors: [],
+          });
+        } catch (dbErr) {
+          console.warn("[copilot] DB insert failed:", dbErr?.message || dbErr);
+        }
+        return res.json(responsePayload);
+      }
+    }
+
     // Compare mode metrics
     let compare = { summary: "", delta_metrics: [] };
     if (mode === "compare") {
@@ -1248,6 +1435,7 @@ router.post("/copilot/query", async (req, res) => {
     let pyResp = null;
     let llmError = null;
     let llmCandidate = null;
+    let pyShapeReason = null;
 
     try {
       pyResp = await callPythonCopilot({
@@ -1264,6 +1452,7 @@ router.post("/copilot/query", async (req, res) => {
 
       const ext = extractCandidateFromPython(pyResp);
       llmCandidate = ext.candidate;
+      pyShapeReason = ext.reason || null;
       if (!llmCandidate && ext.reason) llmError = ext.reason;
     } catch (err) {
       llmError = err?.message || "python_call_failed";
@@ -1310,6 +1499,9 @@ router.post("/copilot/query", async (req, res) => {
       json: finalJson,
       evidence,
       llm_error: llmError,
+      python_source: safeStr(pyResp?.source, null),
+      python_llm_used: pyResp?.llm_used === true,
+      python_shape_reason: pyShapeReason,
       latency_ms: latencyMs,
     };
 
@@ -1437,6 +1629,86 @@ function looksLikeCopilotSchema(x) {
   );
 }
 
+function buildSchemaFromAnswerText(answerText) {
+  const text = safeStr(answerText, "");
+  if (!text) return null;
+  return {
+    answer_title: "Copilot Answer",
+    direct_answer: text,
+    key_points: [],
+    actions: [],
+    comparison: { summary: "", delta_metrics: [] },
+    risks: ["Risk assessment is limited because interval evidence may be incomplete."],
+    uncertainties: ["Detailed deterministic/narrative evidence is missing or limited for this query."],
+    confidence: { overall: 0.55, rubric: "medium", reason: "LLM text response converted to schema." },
+    evidence_used: [],
+    safety_note: "Decision support only, not autonomous control.",
+  };
+}
+
+function syncNarrativeWithDeterministic(narrative, deterministic) {
+  const nar = narrative && typeof narrative === "object" ? { ...narrative } : {};
+  const detIntervals = Array.isArray(deterministic?.intervalFindings)
+    ? deterministic.intervalFindings
+    : [];
+  if (!detIntervals.length) return nar;
+
+  const detMap = new Map();
+  for (const d of detIntervals) {
+    const key = `${String(d?.curve || "")}|${Number(d?.fromDepth)}|${Number(d?.toDepth)}`;
+    detMap.set(key, d);
+  }
+
+  const existing = Array.isArray(nar.interval_explanations) ? nar.interval_explanations : [];
+  if (!existing.length) {
+    nar.interval_explanations = detIntervals.map(detFindingToNarrativeInterval);
+    return nar;
+  }
+
+  nar.interval_explanations = existing.map((it) => {
+    const key = `${String(it?.curve || "")}|${Number(it?.fromDepth)}|${Number(it?.toDepth)}`;
+    const det = detMap.get(key);
+    if (!det) return it;
+    return {
+      ...it,
+      curvesSupporting: det?.curvesSupporting ?? it?.curvesSupporting ?? null,
+      evidenceType: det?.evidenceType ?? it?.evidenceType ?? null,
+      score2: det?.score2 ?? it?.score2 ?? null,
+      baseline: det?.baseline ?? it?.baseline ?? null,
+      score: det?.score ?? it?.score ?? null,
+    };
+  });
+
+  return nar;
+}
+
+function parseCurveSet(curveField) {
+  if (!curveField) return [];
+  if (Array.isArray(curveField)) {
+    return [...new Set(curveField.map((c) => String(c || "").trim()).filter(Boolean))];
+  }
+  return [...new Set(String(curveField).split(",").map((s) => s.trim()).filter(Boolean))];
+}
+
+function normalizeIntervalSupport(det) {
+  const out = det && typeof det === "object" ? { ...det } : {};
+  const arr = Array.isArray(out?.intervalFindings)
+    ? out.intervalFindings.map((x) => ({ ...x }))
+    : [];
+
+  out.intervalFindings = arr.map((it) => {
+    const n = parseCurveSet(it?.curve).length;
+    const cs = Number(it?.curvesSupporting);
+    const nextSupport = Number.isFinite(cs) ? Math.max(cs, n) : Math.max(1, n);
+    return {
+      ...it,
+      curvesSupporting: nextSupport,
+      evidenceType: nextSupport >= 2 ? "multi-curve" : "single-curve",
+    };
+  });
+  return out;
+}
+
 function extractCandidateFromPython(pyResp) {
   if (!isObject(pyResp)) return { candidate: null, reason: "python_non_object_response" };
 
@@ -1461,17 +1733,21 @@ function extractCandidateFromPython(pyResp) {
   const rootParsed = parseMaybeJsonString(pyResp);
   if (looksLikeCopilotSchema(rootParsed)) return { candidate: rootParsed, reason: null };
 
+  // ai-service may return plain string answer with source metadata.
+  const wrapped = buildSchemaFromAnswerText(pyResp?.answer);
+  if (looksLikeCopilotSchema(wrapped)) return { candidate: wrapped, reason: null };
+
   return { candidate: null, reason: "python_response_unrecognized_shape" };
 }
 
 function inferSource(pyResp, llmCandidateExists) {
-  if (!llmCandidateExists) return "fallback";
   const src = safeStr(pyResp?.source, "").toLowerCase();
   const llmUsed = pyResp?.llm_used === true || pyResp?.meta?.llm_used === true;
+  if (!llmCandidateExists && !llmUsed && src !== "llm" && src !== "python") return "fallback";
   if (llmUsed) return "llm";
   if (src === "llm" || src === "python") return "llm";
   if (src === "fallback" || src === "python_fallback") return "fallback";
-  return "llm";
+  return llmCandidateExists ? "llm" : "fallback";
 }
 
 function isGenericDirectAnswer(ans = "") {
@@ -1557,7 +1833,7 @@ function patchDirectAnswerFromEvidence(json, evidence, question = "") {
         const curve = safeStr(nearest.curve, "-");
         const exp = safeStr(nearest.explanation, "anomalous pattern");
         out.direct_answer =
-          dist === 0
+          best === 0
             ? `At ${asked} ft, the depth lies inside a flagged interval ${lo.toFixed(1)}–${hi.toFixed(1)} ft (${curve}): ${exp}.`
             : `At ${asked} ft, no exact flagged interval is centered there; nearest flagged interval is ${lo.toFixed(1)}–${hi.toFixed(1)} ft (${curve}): ${exp}.`;
       } else {
@@ -1610,6 +1886,32 @@ function patchDirectAnswerFromEvidence(json, evidence, question = "") {
         snippet: `severity=${sev}, dataQuality=${dq}, eventCount=${det?.eventCount ?? "n/a"}`,
       },
     ];
+  }
+
+  if (!Array.isArray(out.risks) || out.risks.length === 0) {
+    const risks = [];
+    const sevLower = sev.toLowerCase();
+    if (sevLower.includes("critical") || sevLower.includes("high")) {
+      risks.push(`Global anomaly severity is ${sev}.`);
+    }
+    const riskSummary = safeStr(evidence?.insight?.riskProfile?.summary, "");
+    if (riskSummary) risks.push(riskSummary);
+    if (dq.toLowerCase().includes("low")) {
+      risks.push("Low data quality may increase false positives/negatives.");
+    }
+    if (risks.length === 0) {
+      risks.push("No high-severity risk was inferred from available evidence.");
+    }
+    out.risks = risks;
+  }
+
+  if (!Array.isArray(out.uncertainties) || out.uncertainties.length === 0) {
+    const narLimitations = safeArr(nar?.limitations).map((x) => safeStr(x)).filter(Boolean);
+    const detLimitations = safeArr(det?.limitations).map((x) => safeStr(x)).filter(Boolean);
+    const limitations = narLimitations.length ? narLimitations : detLimitations;
+    out.uncertainties = limitations.length
+      ? limitations
+      : ["Model-based interpretation; validate with domain checks and adjacent intervals."];
   }
 
   out.safety_note = "Decision support only, not autonomous control.";
@@ -1745,291 +2047,7 @@ async function persistCopilotRun({
 
 
 
-router.post("/interpret/export/pdf", async (req, res) => {
-  let doc = null;
-
-  try {
-    const payload = req.body || {};
-    const wellId = String(payload?.well?.wellId || payload?.wellId || "-");
-    const range = payload?.range || {};
-    const fromDepth = toNum(range?.fromDepth ?? payload?.fromDepth);
-    const toDepth = toNum(range?.toDepth ?? payload?.toDepth);
-
-    const modelUsed = String(payload?.modelUsed || "-");
-    const narrativeStatus = String(payload?.narrativeStatus || "-");
-    const createdAtIso = payload?.createdAt || new Date().toISOString();
-    const exportedAtIso = new Date().toISOString();
-
-    const deterministic = payload?.deterministic || {};
-    const narrative = payload?.narrative || {};
-    const insight = payload?.insight || {};
-
-    const severityBand = deterministic?.severityBand || "UNKNOWN";
-    const rMeta = riskMeta(severityBand);
-
-    const intervals = normalizeIntervals(
-      narrative?.interval_explanations,
-      deterministic?.intervalFindings
-    );
-    const topIntervals = intervals.slice(0, 10);
-    const consolidated = consolidateIntervals(topIntervals, 8);
-
-    const recommendations = safeArray(narrative?.recommendations);
-    const limitations = safeArray(narrative?.limitations);
-
-    const filename = `interpretation_report_${wellId}_${Date.now()}.pdf`;
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-
-    doc = new PDFDocument({
-      size: "A4",
-      margins: { top: 40, left: 40, right: 40, bottom: 45 },
-      bufferPages: true,
-      info: {
-        Title: `Interpretation Report - ${wellId}`,
-        Author: "AI Interpretation Service",
-        Subject: "Well Log Interpretation",
-      },
-    });
-
-    doc.on("error", (e) => {
-      console.error("PDFKit error:", e);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "PDF generation failed" });
-      } else {
-        try { res.end(); } catch {}
-      }
-    });
-
-    res.on("close", () => {
-      if (doc && !doc.destroyed) {
-        try { doc.end(); } catch {}
-      }
-    });
-
-    doc.pipe(res);
-
-    drawRoundedRect(doc, 40, 38, 515, 92, 8, "#f8fafc", "#e5e7eb");
-    doc.font("Helvetica-Bold").fontSize(18).fillColor("#111827")
-      .text("AI Interpretation Report", 54, 50);
-    doc.font("Helvetica").fontSize(10).fillColor("#374151")
-      .text("Automated well-log interpretation with deterministic + narrative analysis", 54, 74);
-
-    drawRoundedRect(doc, 425, 50, 112, 26, 12, rMeta.bg, rMeta.border);
-    doc.font("Helvetica-Bold").fontSize(10).fillColor(rMeta.color)
-      .text(`RISK: ${rMeta.label}`, 432, 58, { width: 98, align: "center" });
-
-    doc.y = 140;
-
-    drawRoundedRect(doc, 40, doc.y, 515, 78, 6, "#ffffff", "#e5e7eb");
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Well", 52, doc.y + 12);
-    doc.font("Helvetica").fontSize(10).fillColor("#111827").text(wellId, 160, doc.y + 11);
-
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Depth Range", 52, doc.y + 28);
-    doc.font("Helvetica").fontSize(10).fillColor("#111827")
-      .text(`${fmtInt(fromDepth)} → ${fmtInt(toDepth)} ft`, 160, doc.y + 27);
-
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Model", 52, doc.y + 44);
-    doc.font("Helvetica").fontSize(10).fillColor("#111827").text(modelUsed, 160, doc.y + 43);
-
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Narrative Status", 52, doc.y + 60);
-    doc.font("Helvetica").fontSize(10).fillColor("#111827").text(narrativeStatus, 160, doc.y + 59);
-
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Run Time", 322, doc.y + 12);
-    doc.font("Helvetica").fontSize(10).fillColor("#111827")
-      .text(new Date(createdAtIso).toLocaleString(), 395, doc.y + 11, { width: 150 });
-
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151").text("Export Time", 322, doc.y + 28);
-    doc.font("Helvetica").fontSize(10).fillColor("#111827")
-      .text(new Date(exportedAtIso).toLocaleString(), 395, doc.y + 27, { width: 150 });
-
-    doc.y += 88;
-
-    drawSectionTitle(doc, "Executive Summary");
-    ensureSpace(doc, 90);
-
-    const cardsY = doc.y;
-    const gap = 10;
-    const cardW = (515 - gap * 4) / 5;
-    const cardH = 58;
-    const cards = [
-      { title: "Global Risk", value: rMeta.label, color: rMeta.color, bg: rMeta.bg, border: rMeta.border },
-      { title: "Events", value: String(deterministic?.eventCount ?? "-"), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
-      { title: "Detect Conf", value: fmt(deterministic?.detectionConfidence ?? deterministic?.confidence, 3), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
-      { title: "Severity Conf", value: fmt(deterministic?.severityConfidence, 3), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
-      { title: "Data Quality", value: String(deterministic?.dataQuality?.qualityBand || "-").toUpperCase(), color: "#111827", bg: "#f9fafb", border: "#e5e7eb" },
-    ];
-
-    cards.forEach((c, i) => {
-      const x = 40 + i * (cardW + gap);
-      drawRoundedRect(doc, x, cardsY, cardW, cardH, 6, c.bg, c.border);
-      doc.font("Helvetica").fontSize(8).fillColor("#6b7280").text(c.title, x + 8, cardsY + 8, { width: cardW - 16 });
-      doc.font("Helvetica-Bold").fontSize(12).fillColor(c.color).text(c.value, x + 8, cardsY + 24, { width: cardW - 16, ellipsis: true });
-    });
-
-    doc.y = cardsY + cardH + 8;
-
-    if (insight?.summaryParagraph) {
-      ensureSpace(doc, 65);
-      drawRoundedRect(doc, 40, doc.y, 515, 54, 6, "#ffffff", "#e5e7eb");
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#111827").text("Interpretation Summary", 50, doc.y + 8);
-      doc.font("Helvetica").fontSize(9.5).fillColor("#374151")
-        .text(String(insight.summaryParagraph), 50, doc.y + 24, { width: 495, height: 24, ellipsis: true });
-      doc.y += 62;
-    }
-
-    drawSectionTitle(doc, "Top Intervals");
-    ensureSpace(doc, 70);
-
-    if (!topIntervals.length) {
-      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
-      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No key intervals detected for this run.", 52, doc.y + 11);
-      doc.y += 44;
-    } else {
-      topIntervals.forEach((it, i) => {
-        ensureSpace(doc, 26);
-        drawRoundedRect(doc, 40, doc.y, 515, 22, 4, i % 2 === 0 ? "#ffffff" : "#fafafa", "#eef2f7");
-        doc.font("Helvetica").fontSize(8.7).fillColor("#111827")
-          .text(
-            `${i + 1}. ${it.curve || "-"} | ${fmtInt(it.fromDepth)} → ${fmtInt(it.toDepth)} ft | Priority: ${it.priority || "-"} | Prob: ${it.probability || "-"} | Conf: ${fmt(it.confidence, 2)}`,
-            48,
-            doc.y + 7,
-            { width: 500, ellipsis: true }
-          );
-        doc.y += 24;
-      });
-      doc.y += 4;
-    }
-
-    drawSectionTitle(doc, "Consolidated Intervals (Composite)");
-    ensureSpace(doc, 60);
-
-    if (!consolidated.length) {
-      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
-      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No composite intervals available.", 52, doc.y + 11);
-      doc.y += 44;
-    } else {
-      consolidated.forEach((c, i) => {
-        ensureSpace(doc, 26);
-        drawRoundedRect(doc, 40, doc.y, 515, 22, 4, i % 2 === 0 ? "#ffffff" : "#f8fafc", "#e5e7eb");
-        doc.font("Helvetica").fontSize(8.7).fillColor("#111827")
-          .text(
-            `C${c.compositeId} | ${fmtInt(c.fromDepth)} → ${fmtInt(c.toDepth)} ft | N=${c.intervalCount} | Width=${fmt(c.width, 1)} | Priority=${c.dominantPriority} | AvgConf=${fmt(c.avgConfidence, 2)} | Curves=${c.curves || "-"}`,
-            48,
-            doc.y + 7,
-            { width: 500, ellipsis: true }
-          );
-        doc.y += 24;
-      });
-      doc.y += 4;
-    }
-
-    drawSectionTitle(doc, "Recommendations");
-    ensureSpace(doc, 45);
-    if (!recommendations.length) {
-      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
-      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No recommendations provided.", 52, doc.y + 11);
-      doc.y += 44;
-    } else {
-      const h = Math.max(38, recommendations.length * 16 + 16);
-      drawRoundedRect(doc, 40, doc.y, 515, h, 6, "#ffffff", "#e5e7eb");
-      let y = doc.y + 10;
-      doc.font("Helvetica").fontSize(10).fillColor("#111827");
-      recommendations.forEach((r, i) => {
-        doc.text(`${i + 1}. ${String(r)}`, 52, y, { width: 490 });
-        y += 16;
-      });
-      doc.y = y + 2;
-    }
-
-    drawSectionTitle(doc, "Limitations");
-    ensureSpace(doc, 45);
-    if (!limitations.length) {
-      drawRoundedRect(doc, 40, doc.y, 515, 34, 6, "#ffffff", "#e5e7eb");
-      doc.font("Helvetica").fontSize(10).fillColor("#6b7280").text("No limitations provided.", 52, doc.y + 11);
-      doc.y += 44;
-    } else {
-      const h = Math.max(38, limitations.length * 16 + 16);
-      drawRoundedRect(doc, 40, doc.y, 515, h, 6, "#ffffff", "#e5e7eb");
-      let y = doc.y + 10;
-      doc.font("Helvetica").fontSize(10).fillColor("#111827");
-      limitations.forEach((l, i) => {
-        doc.text(`${i + 1}. ${String(l)}`, 52, y, { width: 490 });
-        y += 16;
-      });
-      doc.y = y + 2;
-    }
-
-    const pageCount = doc.bufferedPageRange().count;
-    for (let i = 0; i < pageCount; i++) {
-      doc.switchToPage(i);
-      drawPageFooter(doc);
-    }
-
-    doc.end();
-  } catch (err) {
-    console.error("POST /api/ai/interpret/export/pdf failed:", err);
-    if (!res.headersSent) {
-      return res.status(500).json({ error: err?.message || "PDF export failed" });
-    }
-    try { res.end(); } catch {}
-  }
-});
-
-
-router.get("/copilot/runs", async (req, res) => {
-  try {
-    const wellId = req.query.wellId ? String(req.query.wellId) : undefined;
-    const limit = Number(req.query.limit) || 20;
-    const runs = await listCopilotRuns({ wellId, limit });
-    return res.json({ ok: true, runs });
-  } catch (err) {
-    console.error("GET /api/ai/copilot/runs failed:", err);
-    return res.status(500).json({ error: err?.message || "Failed to list copilot runs" });
-  }
-});
-
-router.get("/copilot/runs/:id", async (req, res) => {
-  try {
-    const row = await getCopilotRunById(req.params.id);
-    if (!row) return res.status(404).json({ error: "Copilot run not found" });
-    return res.json({ ok: true, run: row });
-  } catch (err) {
-    console.error("GET /api/ai/copilot/runs/:id failed:", err);
-    return res.status(500).json({ error: err?.message || "Failed to fetch copilot run" });
-  }
-});
-
-
-
-
-// GET /api/ai/copilot/history?wellId=WELL_...&limit=20
-router.get("/copilot/history", async (req, res) => {
-  try {
-    const wellId = String(req.query.wellId || "").trim();
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 20)));
-
-    const sql = `
-      SELECT run_id, created_at, well_id, mode, question, source, llm_used,
-             schema_valid, evidence_strength, latency_ms, response_json
-      FROM copilot_runs
-      ${wellId ? "WHERE well_id = $1" : ""}
-      ORDER BY created_at DESC
-      LIMIT ${wellId ? "$2" : "$1"}
-    `;
-    const vals = wellId ? [wellId, limit] : [limit];
-    const out = await pgPool.query(sql, vals);
-
-    return res.json({ ok: true, count: out.rowCount, rows: out.rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-
-
-
-
+registerInterpretExportPdfRoute(router);
+registerCopilotHistoryRoutes(router, { listCopilotRuns, getCopilotRunById, pgPool });
 
 export default router;

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="Wellsite - Phase3 Tests" tests="6" time="0.103">
+  <testsuite name="01 - window-data cold broad (R1)" id="3b33e1e9-8f71-4389-85cd-60b7c10975a0" timestamp="2026-02-16T07:04:00.676Z" tests="4" failures="0" errors="0" time="0.038">
+    <testcase name="status is 200" time="0.038" classname="01WindowDataColdBroadR1"/>
+    <testcase name="ok=true" time="0.038" classname="01WindowDataColdBroadR1"/>
+    <testcase name="rows is array" time="0.038" classname="01WindowDataColdBroadR1"/>
+    <testcase name="rows sorted by depth" time="0.038" classname="01WindowDataColdBroadR1"/>
+  </testsuite>
+  <testsuite name="02 - window-data warm broad repeat (R1)" id="fffc99b9-aeac-4c84-8804-1594ed97866e" timestamp="2026-02-16T07:04:00.676Z" tests="6" failures="0" errors="0" time="0.012">
+    <testcase name="status is 200" time="0.012" classname="02WindowDataWarmBroadRepeatR1"/>
+    <testcase name="ok=true" time="0.012" classname="02WindowDataWarmBroadRepeatR1"/>
+    <testcase name="rows is array" time="0.012" classname="02WindowDataWarmBroadRepeatR1"/>
+    <testcase name="repeat has rows" time="0.012" classname="02WindowDataWarmBroadRepeatR1"/>
+    <testcase name="repeat rows roughly consistent" time="0.012" classname="02WindowDataWarmBroadRepeatR1"/>
+    <testcase name="warm request should not be slower by large margin" time="0.012" classname="02WindowDataWarmBroadRepeatR1"/>
+  </testsuite>
+  <testsuite name="03 - window-data nested range (R2)" id="7115488d-919a-4356-8a3d-ece0128b2efd" timestamp="2026-02-16T07:04:00.676Z" tests="4" failures="0" errors="0" time="0.007">
+    <testcase name="status is 200" time="0.007" classname="03WindowDataNestedRangeR2"/>
+    <testcase name="ok=true" time="0.007" classname="03WindowDataNestedRangeR2"/>
+    <testcase name="rows exist" time="0.007" classname="03WindowDataNestedRangeR2"/>
+    <testcase name="rows are cropped to requested range" time="0.007" classname="03WindowDataNestedRangeR2"/>
+  </testsuite>
+  <testsuite name="04 - window-data zoom detail (R3)" id="91e1c7b7-b89d-4c46-961c-06dbd271c59b" timestamp="2026-02-16T07:04:00.676Z" tests="4" failures="0" errors="0" time="0.037">
+    <testcase name="status is 200" time="0.037" classname="04WindowDataZoomDetailR3"/>
+    <testcase name="ok=true" time="0.037" classname="04WindowDataZoomDetailR3"/>
+    <testcase name="rows exist" time="0.037" classname="04WindowDataZoomDetailR3"/>
+    <testcase name="planner estimated points exists" time="0.037" classname="04WindowDataZoomDetailR3"/>
+  </testsuite>
+  <testsuite name="05 - sparse/null metric quality gate" id="13356022-d669-4777-a178-9579e37c88b2" timestamp="2026-02-16T07:04:00.676Z" tests="3" failures="0" errors="0" time="0.004">
+    <testcase name="status is 200 (no crash)" time="0.004" classname="05SparseNullMetricQualityGate"/>
+    <testcase name="ok=true" time="0.004" classname="05SparseNullMetricQualityGate"/>
+    <testcase name="response still structured" time="0.004" classname="05SparseNullMetricQualityGate"/>
+  </testsuite>
+  <testsuite name="06 - window-plan endpoint (if enabled)" id="f507247b-d088-4792-82d2-a4dde7320230" timestamp="2026-02-16T07:04:00.676Z" tests="4" failures="0" errors="0" time="0.005">
+    <testcase name="status is 200" time="0.005" classname="06WindowPlanEndpointIfEnabled"/>
+    <testcase name="plan has source + level" time="0.005" classname="06WindowPlanEndpointIfEnabled"/>
+    <testcase name="estimated points exists" time="0.005" classname="06WindowPlanEndpointIfEnabled"/>
+    <testcase name="tiles stats exists" time="0.005" classname="06WindowPlanEndpointIfEnabled"/>
+  </testsuite>
+</testsuites>

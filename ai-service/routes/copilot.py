@@ -3,9 +3,9 @@ import json
 import logging
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from app.ai_client import chat_with_data
+from app.ai_client import chat_with_data_verbose
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/copilot", tags=["copilot"])
@@ -71,10 +71,10 @@ async def copilot_query(req: CopilotReq):
     well_summary = _build_well_summary(req)
     data_context = _build_data_context(req)
 
-    # If you want: “Tell me a summary” -> standard question
+    # If you want: "Tell me a summary" -> standard question
     msg = req.question or "Give a concise technical summary."
 
-    answer = chat_with_data(
+    result = chat_with_data_verbose(
         well_name=req.wellId,
         message=msg,
         history=req.history,
@@ -82,12 +82,35 @@ async def copilot_query(req: CopilotReq):
         data_context=data_context,
         detail_level=req.detail_level,
     )
+    source = str(result.get("source", "fallback"))
+    llm_used = bool(result.get("llm_used", False))
+    provider = result.get("provider")
+    model = result.get("model")
+    llm_error = result.get("llm_error")
+    answer = str(result.get("answer", "No response was generated."))
+
+    logger.info(
+        "copilot.query source=%s llm_used=%s provider=%s model=%s wellId=%s mode=%s",
+        source,
+        llm_used,
+        provider,
+        model,
+        req.wellId,
+        req.mode,
+    )
+    if llm_error:
+        logger.warning("copilot.query llm_error=%s", llm_error)
 
     return {
         "ok": True,
-        "source": "ai_client_chat_with_data",
+        "source": source,
+        "llm_used": llm_used,
+        "provider": provider,
+        "model": model,
+        "llm_error": llm_error,
         "wellId": req.wellId,
         "range": {"fromDepth": req.fromDepth, "toDepth": req.toDepth},
         "curves": req.curves,
         "answer": answer,
     }
+

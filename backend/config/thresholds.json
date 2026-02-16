@@ -1,0 +1,52 @@
+{
+  "version": "phase-2.0",
+  "bands": {
+    "critical": 0.8,
+    "high": 0.65,
+    "moderate": 0.45
+  },
+  "quality": {
+    "minFiniteRatio": 0.7,
+    "maxNullRatio": 0.25,
+    "minPoints": 20
+  },
+  "baseline": {
+    "baselineWindowFt": 2000,
+    "minBaselinePoints": 80,
+    "baselineWindowPadFt": 1500,
+    "windowPadFt": 1500,
+    "windowFt": 1500,
+    "noisyStdMultiplier": 1.8,
+    "spikeRobustZ": 6,
+    "spikeZ": 3,
+    "stepShiftStdMultiplier": 2.5,
+    "driftCorr": 2,
+    "noiseCvZ": 2.5
+  },
+  "detection": {
+    "spikeZ": 3,
+    "stepZ": 2.5,
+    "driftSlopeZ": 2,
+    "noiseCvZ": 2.5
+  },
+  "ranking": {
+    "requireMultiCurveTopN": 2,
+    "multiCurveMinSupport": 2,
+    "gapToleranceFt": 8
+  },
+  "anomalyScoreBands": {
+    "low": 0.35,
+    "medium": 0.55,
+    "high": 0.72,
+    "critical": 0.85
+  },
+  "interval": {
+    "topN": 10,
+    "minRows": 20,
+    "minFiniteRatio": 0.7,
+    "enforceMinMultiCurve": 2,
+    "multiCurveBoost": 0.12,
+    "singleCurvePenalty": 0.08,
+    "minMultiInTop": 2
+  }
+}

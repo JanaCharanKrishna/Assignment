@@ -1,0 +1,24 @@
+{
+  "originalVersion": 1,
+  "startVersion": 1,
+  "bumpedVersion": 2,
+  "baselineBeforeBump": {
+    "source": "mongo",
+    "hit": 0,
+    "miss": 7
+  },
+  "beforeVCount": 7,
+  "afterVCount": 7,
+  "afterBumpRequest1": {
+    "source": "mongo",
+    "hit": 0,
+    "miss": 7,
+    "completeness": "partial"
+  },
+  "afterBumpRequest2": {
+    "source": "redis",
+    "hit": 7,
+    "miss": 0,
+    "completeness": "complete"
+  }
+}

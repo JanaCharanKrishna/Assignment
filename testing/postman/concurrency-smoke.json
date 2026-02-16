@@ -1,0 +1,18 @@
+{
+  "summary": {
+    "total": 100,
+    "concurrency": 30,
+    "httpFail": 0,
+    "notOk": 0,
+    "unsorted": 0,
+    "duplicateDepthResponses": 0,
+    "latencyMs": {
+      "min": 25,
+      "p50": 66,
+      "p95": 102,
+      "max": 111,
+      "avg": 67.89
+    }
+  },
+  "sampleFailures": []
+}

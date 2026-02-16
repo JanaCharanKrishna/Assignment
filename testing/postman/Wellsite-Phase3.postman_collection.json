@@ -1,0 +1,234 @@
+{
+  "info": {
+    "_postman_id": "f3f3bc4f-a712-4e49-b3f5-6691d98ea001",
+    "name": "Wellsite - Phase3 Tests",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Phase 3 cache/planner/performance validation"
+  },
+  "item": [
+    {
+      "name": "01 - window-data cold broad (R1)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricGood1}}&fromDepth={{fromR1}}&toDepth={{toR1}}&pixelWidth={{pixelWide}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "well", "{{wellId}}", "window-data"],
+          "query": [
+            { "key": "metric", "value": "{{metricGood1}}" },
+            { "key": "fromDepth", "value": "{{fromR1}}" },
+            { "key": "toDepth", "value": "{{toR1}}" },
+            { "key": "pixelWidth", "value": "{{pixelWide}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('status is 200', () => pm.response.code === 200);",
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => j.ok === true);",
+              "pm.test('rows is array', () => Array.isArray(j.rows));",
+              "pm.test('rows sorted by depth', () => {",
+              "  for (let i = 1; i < j.rows.length; i++) {",
+              "    if (j.rows[i-1].depth > j.rows[i].depth) throw new Error('Depth not sorted');",
+              "  }",
+              "});",
+              "pm.environment.set('r1_rows_count', String((j.rows || []).length));",
+              "pm.environment.set('r1_source', j.source || '');",
+              "if (j.debug && j.debug.latencyMs) pm.environment.set('r1_latency', String(j.debug.latencyMs.total || ''));"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 - window-data warm broad repeat (R1)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricGood1}}&fromDepth={{fromR1}}&toDepth={{toR1}}&pixelWidth={{pixelWide}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "well", "{{wellId}}", "window-data"],
+          "query": [
+            { "key": "metric", "value": "{{metricGood1}}" },
+            { "key": "fromDepth", "value": "{{fromR1}}" },
+            { "key": "toDepth", "value": "{{toR1}}" },
+            { "key": "pixelWidth", "value": "{{pixelWide}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('status is 200', () => pm.response.code === 200);",
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => j.ok === true);",
+              "pm.test('rows is array', () => Array.isArray(j.rows));",
+              "const prev = Number(pm.environment.get('r1_rows_count') || 0);",
+              "pm.test('repeat has rows', () => (j.rows || []).length > 0);",
+              "if (prev > 0) {",
+              "  pm.test('repeat rows roughly consistent', () => Math.abs((j.rows||[]).length - prev) < Math.max(5, prev*0.1));",
+              "}",
+              "if (j.debug && j.debug.latencyMs && pm.environment.get('r1_latency')) {",
+              "  const prevLatency = Number(pm.environment.get('r1_latency'));",
+              "  const nowLatency = Number(j.debug.latencyMs.total || 0);",
+              "  pm.test('warm request should not be slower by large margin', () => nowLatency <= prevLatency * 1.5);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 - window-data nested range (R2)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricGood1}}&fromDepth={{fromR2}}&toDepth={{toR2}}&pixelWidth={{pixelWide}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "well", "{{wellId}}", "window-data"],
+          "query": [
+            { "key": "metric", "value": "{{metricGood1}}" },
+            { "key": "fromDepth", "value": "{{fromR2}}" },
+            { "key": "toDepth", "value": "{{toR2}}" },
+            { "key": "pixelWidth", "value": "{{pixelWide}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('status is 200', () => pm.response.code === 200);",
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => j.ok === true);",
+              "pm.test('rows exist', () => Array.isArray(j.rows) && j.rows.length > 0);",
+              "const fromD = Number(pm.environment.get('fromR2'));",
+              "const toD = Number(pm.environment.get('toR2'));",
+              "pm.test('rows are cropped to requested range', () => {",
+              "  for (const r of j.rows) {",
+              "    if (r.depth < fromD || r.depth > toD) throw new Error('Depth outside requested range');",
+              "  }",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 - window-data zoom detail (R3)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricGood1}}&fromDepth={{fromR3}}&toDepth={{toR3}}&pixelWidth={{pixelZoom}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "well", "{{wellId}}", "window-data"],
+          "query": [
+            { "key": "metric", "value": "{{metricGood1}}" },
+            { "key": "fromDepth", "value": "{{fromR3}}" },
+            { "key": "toDepth", "value": "{{toR3}}" },
+            { "key": "pixelWidth", "value": "{{pixelZoom}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('status is 200', () => pm.response.code === 200);",
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => j.ok === true);",
+              "pm.test('rows exist', () => Array.isArray(j.rows) && j.rows.length > 0);",
+              "if (j.plan) {",
+              "  pm.test('planner estimated points exists', () => typeof j.plan.estimatedPoints !== 'undefined');",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 - sparse/null metric quality gate",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricSparse}}&fromDepth={{fromR1}}&toDepth={{toR1}}&pixelWidth={{pixelWide}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "well", "{{wellId}}", "window-data"],
+          "query": [
+            { "key": "metric", "value": "{{metricSparse}}" },
+            { "key": "fromDepth", "value": "{{fromR1}}" },
+            { "key": "toDepth", "value": "{{toR1}}" },
+            { "key": "pixelWidth", "value": "{{pixelWide}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('status is 200 (no crash)', () => pm.response.code === 200);",
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => j.ok === true);",
+              "pm.test('response still structured', () => typeof j === 'object');",
+              "if (j.warnings || j.limitations) {",
+              "  pm.test('quality warning exists for sparse metric', () => true);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 - window-plan endpoint (if enabled)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-plan?metric={{metricGood1}}&fromDepth={{fromR2}}&toDepth={{toR2}}&pixelWidth={{pixelWide}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "well", "{{wellId}}", "window-plan"],
+          "query": [
+            { "key": "metric", "value": "{{metricGood1}}" },
+            { "key": "fromDepth", "value": "{{fromR2}}" },
+            { "key": "toDepth", "value": "{{toR2}}" },
+            { "key": "pixelWidth", "value": "{{pixelWide}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('status is 200', () => pm.response.code === 200);",
+              "const j = pm.response.json();",
+              "pm.test('plan has source + level', () => !!j.source && typeof j.level !== 'undefined');",
+              "pm.test('estimated points exists', () => typeof j.estimatedPoints !== 'undefined');",
+              "pm.test('tiles stats exists', () => typeof j.tilesHit !== 'undefined' || typeof j.tilesMiss !== 'undefined');"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ]
+}

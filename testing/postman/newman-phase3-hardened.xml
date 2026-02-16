@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="Wellsite - Phase3 Hardened Tests" tests="9" time="2.918">
+  <testsuite name="A) R1 Cold broad window-data" id="c99c1f96-39b9-4938-ae4b-c575f6865000" timestamp="2026-02-16T07:16:53.719Z" tests="8" failures="0" errors="0" time="0.035">
+    <testcase name="HTTP status is 2xx" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="Response is JSON" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="Response parses to JSON object" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="ok=true" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="rows is array" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="rows not empty" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="rows sorted by depth asc" time="0.035" classname="AR1ColdBroadWindowData"/>
+    <testcase name="rows cropped to requested range" time="0.035" classname="AR1ColdBroadWindowData"/>
+  </testsuite>
+  <testsuite name="B) R1 Warm broad repeat" id="8d9b8e09-ea9b-41de-93f5-5562c93c2af1" timestamp="2026-02-16T07:16:53.719Z" tests="7" failures="0" errors="0" time="0.014">
+    <testcase name="HTTP status is 2xx" time="0.014" classname="BR1WarmBroadRepeat"/>
+    <testcase name="Response is JSON" time="0.014" classname="BR1WarmBroadRepeat"/>
+    <testcase name="Response parses to JSON object" time="0.014" classname="BR1WarmBroadRepeat"/>
+    <testcase name="ok=true" time="0.014" classname="BR1WarmBroadRepeat"/>
+    <testcase name="repeat has rows" time="0.014" classname="BR1WarmBroadRepeat"/>
+    <testcase name="warm request not much slower than cold" time="0.014" classname="BR1WarmBroadRepeat"/>
+    <testcase name="repeat row count roughly consistent" time="0.014" classname="BR1WarmBroadRepeat"/>
+  </testsuite>
+  <testsuite name="C) R2 Nested range crop test" id="03d87796-79c5-48ef-b294-e63a0136c67c" timestamp="2026-02-16T07:16:53.719Z" tests="7" failures="0" errors="0" time="0.006">
+    <testcase name="HTTP status is 2xx" time="0.006" classname="CR2NestedRangeCropTest"/>
+    <testcase name="Response is JSON" time="0.006" classname="CR2NestedRangeCropTest"/>
+    <testcase name="Response parses to JSON object" time="0.006" classname="CR2NestedRangeCropTest"/>
+    <testcase name="ok=true" time="0.006" classname="CR2NestedRangeCropTest"/>
+    <testcase name="rows exist" time="0.006" classname="CR2NestedRangeCropTest"/>
+    <testcase name="all rows inside requested range" time="0.006" classname="CR2NestedRangeCropTest"/>
+    <testcase name="rows sorted" time="0.006" classname="CR2NestedRangeCropTest"/>
+  </testsuite>
+  <testsuite name="D) Boundary stitch test" id="0e94b199-ec9d-44c5-93b9-d74981493aa9" timestamp="2026-02-16T07:16:53.719Z" tests="7" failures="0" errors="0" time="0.007">
+    <testcase name="HTTP status is 2xx" time="0.007" classname="DBoundaryStitchTest"/>
+    <testcase name="Response is JSON" time="0.007" classname="DBoundaryStitchTest"/>
+    <testcase name="Response parses to JSON object" time="0.007" classname="DBoundaryStitchTest"/>
+    <testcase name="ok=true" time="0.007" classname="DBoundaryStitchTest"/>
+    <testcase name="boundary request returns rows" time="0.007" classname="DBoundaryStitchTest"/>
+    <testcase name="no duplicate depth values" time="0.007" classname="DBoundaryStitchTest"/>
+    <testcase name="rows strictly in boundary window" time="0.007" classname="DBoundaryStitchTest"/>
+  </testsuite>
+  <testsuite name="E) R3 Zoom detail test" id="4d10bef3-1d1d-4f2a-a597-77e03a36730a" timestamp="2026-02-16T07:16:53.719Z" tests="5" failures="0" errors="0" time="0.006">
+    <testcase name="HTTP status is 2xx" time="0.006" classname="ER3ZoomDetailTest"/>
+    <testcase name="Response is JSON" time="0.006" classname="ER3ZoomDetailTest"/>
+    <testcase name="Response parses to JSON object" time="0.006" classname="ER3ZoomDetailTest"/>
+    <testcase name="ok=true" time="0.006" classname="ER3ZoomDetailTest"/>
+    <testcase name="zoom rows exist" time="0.006" classname="ER3ZoomDetailTest"/>
+  </testsuite>
+  <testsuite name="F) window-plan overview low pixel budget" id="10014dbd-58bb-43e6-94da-61e59cfe388c" timestamp="2026-02-16T07:16:53.719Z" tests="7" failures="0" errors="0" time="0.008">
+    <testcase name="HTTP status is 2xx" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+    <testcase name="Response is JSON" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+    <testcase name="Response parses to JSON object" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+    <testcase name="plan status ok" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+    <testcase name="plan has source + level" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+    <testcase name="estimated points exists" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+    <testcase name="tiles stats exists" time="0.008" classname="FWindowPlanOverviewLowPixelBudget"/>
+  </testsuite>
+  <testsuite name="G) window-plan zoom high pixel budget" id="dc9d3177-f4cf-4998-a6e7-2e53a9c1ff65" timestamp="2026-02-16T07:16:53.719Z" tests="4" failures="0" errors="0" time="0.005">
+    <testcase name="HTTP status is 2xx" time="0.005" classname="GWindowPlanZoomHighPixelBudget"/>
+    <testcase name="Response is JSON" time="0.005" classname="GWindowPlanZoomHighPixelBudget"/>
+    <testcase name="Response parses to JSON object" time="0.005" classname="GWindowPlanZoomHighPixelBudget"/>
+    <testcase name="high pixel should choose finer or equal level" time="0.005" classname="GWindowPlanZoomHighPixelBudget"/>
+  </testsuite>
+  <testsuite name="H) Sparse/null quality gate via interpret" id="1776cf00-0b1b-4713-b00d-d768f8c6607a" timestamp="2026-02-16T07:16:53.719Z" tests="6" failures="0" errors="0" time="1.203">
+    <testcase name="HTTP status is 2xx" time="1.203" classname="HSparseNullQualityGateViaInterpret"/>
+    <testcase name="Response is JSON" time="1.203" classname="HSparseNullQualityGateViaInterpret"/>
+    <testcase name="Response parses to JSON object" time="1.203" classname="HSparseNullQualityGateViaInterpret"/>
+    <testcase name="status structured + ok true" time="1.203" classname="HSparseNullQualityGateViaInterpret"/>
+    <testcase name="deterministic present" time="1.203" classname="HSparseNullQualityGateViaInterpret"/>
+    <testcase name="quality warning appears for sparse/null curve" time="1.203" classname="HSparseNullQualityGateViaInterpret"/>
+  </testsuite>
+  <testsuite name="I) Multi-curve evidence test I2 via interpret" id="da449d4b-f443-4f39-b7de-727d25b7cab7" timestamp="2026-02-16T07:16:53.719Z" tests="6" failures="0" errors="0" time="1.634">
+    <testcase name="HTTP status is 2xx" time="1.634" classname="IMultiCurveEvidenceTestI2ViaInterpret"/>
+    <testcase name="Response is JSON" time="1.634" classname="IMultiCurveEvidenceTestI2ViaInterpret"/>
+    <testcase name="Response parses to JSON object" time="1.634" classname="IMultiCurveEvidenceTestI2ViaInterpret"/>
+    <testcase name="intervalFindings exists" time="1.634" classname="IMultiCurveEvidenceTestI2ViaInterpret"/>
+    <testcase name="at least one multi-curve interval exists" time="1.634" classname="IMultiCurveEvidenceTestI2ViaInterpret"/>
+    <testcase name="all intervals have evidenceType + curvesSupporting" time="1.634" classname="IMultiCurveEvidenceTestI2ViaInterpret"/>
+  </testsuite>
+</testsuites>

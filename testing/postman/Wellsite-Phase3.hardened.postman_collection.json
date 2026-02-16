@@ -1,0 +1,555 @@
+{
+  "info": {
+    "_postman_id": "d0f5e97f-c9d3-40fc-bd9e-a50cc9f65f9d",
+    "name": "Wellsite - Phase3 Hardened Tests",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Hardened Phase 3 validation for cache, planner, boundaries, and interpretation quality."
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.environment.set('t_start_ms', Date.now().toString());"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('HTTP status is 2xx', function () {",
+          "  pm.expect(pm.response.code).to.be.within(200, 299);",
+          "});",
+          "pm.test('Response is JSON', function () {",
+          "  pm.response.to.have.header('Content-Type');",
+          "  const ct = (pm.response.headers.get('Content-Type') || '').toLowerCase();",
+          "  pm.expect(ct).to.include('application/json');",
+          "});",
+          "pm.test('Response parses to JSON object', function () {",
+          "  const json = pm.response.json();",
+          "  pm.expect(json).to.be.an('object');",
+          "});",
+          "pm.environment.set('last_response_time_ms', String(pm.response.responseTime));"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "A) R1 Cold broad window-data",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricMain}}&fromDepth=12348&toDepth=13568&pixelWidth=1400",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-data"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "12348"
+            },
+            {
+              "key": "toDepth",
+              "value": "13568"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "1400"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => pm.expect(j.ok).to.eql(true));",
+              "pm.test('rows is array', () => pm.expect(j.rows).to.be.an('array'));",
+              "pm.test('rows not empty', () => pm.expect(j.rows.length).to.be.greaterThan(0));",
+              "pm.test('rows sorted by depth asc', () => {",
+              "  for (let i = 1; i < j.rows.length; i++) pm.expect(Number(j.rows[i].depth)).to.be.at.least(Number(j.rows[i-1].depth));",
+              "});",
+              "pm.test('rows cropped to requested range', () => {",
+              "  const fromD = 12348, toD = 13568;",
+              "  const minD = Math.min(...j.rows.map(r => Number(r.depth)));",
+              "  const maxD = Math.max(...j.rows.map(r => Number(r.depth)));",
+              "  pm.expect(minD).to.be.at.least(fromD);",
+              "  pm.expect(maxD).to.be.at.most(toD);",
+              "});",
+              "pm.environment.set('r1_cold_time', String(pm.response.responseTime));",
+              "pm.environment.set('r1_cold_count', String(j.rows.length));",
+              "pm.environment.set('r1_cold_source', String(j.source || ''));",
+              "pm.environment.set('r1_cold_tilesHit', String((j.tiles && j.tiles.hit) ?? -1));",
+              "pm.environment.set('r1_cold_tilesMiss', String((j.tiles && j.tiles.miss) ?? -1));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "B) R1 Warm broad repeat",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricMain}}&fromDepth=12348&toDepth=13568&pixelWidth=1400",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-data"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "12348"
+            },
+            {
+              "key": "toDepth",
+              "value": "13568"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "1400"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => pm.expect(j.ok).to.eql(true));",
+              "pm.test('repeat has rows', () => pm.expect((j.rows || []).length).to.be.greaterThan(0));",
+              "const coldTime = Number(pm.environment.get('r1_cold_time') || '999999');",
+              "const warmTime = Number(pm.response.responseTime);",
+              "pm.test('warm request not much slower than cold', () => pm.expect(warmTime).to.be.below(coldTime * 1.5));",
+              "const coldCount = Number(pm.environment.get('r1_cold_count') || '0');",
+              "const warmCount = Number((j.rows || []).length);",
+              "pm.test('repeat row count roughly consistent', () => {",
+              "  const diff = Math.abs(warmCount - coldCount);",
+              "  pm.expect(diff).to.be.below(Math.max(10, Math.floor(coldCount * 0.1)));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "C) R2 Nested range crop test",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricMain}}&fromDepth=12560&toDepth=12948&pixelWidth=900",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-data"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "12560"
+            },
+            {
+              "key": "toDepth",
+              "value": "12948"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "900"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => pm.expect(j.ok).to.eql(true));",
+              "pm.test('rows exist', () => pm.expect((j.rows || []).length).to.be.greaterThan(0));",
+              "pm.test('all rows inside requested range', () => {",
+              "  const fromD = 12560, toD = 12948;",
+              "  j.rows.forEach(r => {",
+              "    const d = Number(r.depth);",
+              "    pm.expect(d).to.be.at.least(fromD);",
+              "    pm.expect(d).to.be.at.most(toD);",
+              "  });",
+              "});",
+              "pm.test('rows sorted', () => {",
+              "  for (let i = 1; i < j.rows.length; i++) pm.expect(Number(j.rows[i].depth)).to.be.at.least(Number(j.rows[i - 1].depth));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D) Boundary stitch test",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricMain}}&fromDepth=12599&toDepth=12601&pixelWidth=1200",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-data"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "12599"
+            },
+            {
+              "key": "toDepth",
+              "value": "12601"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "1200"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => pm.expect(j.ok).to.eql(true));",
+              "pm.test('boundary request returns rows', () => pm.expect((j.rows || []).length).to.be.greaterThan(0));",
+              "pm.test('no duplicate depth values', () => {",
+              "  const depths = (j.rows || []).map(r => Number(r.depth).toFixed(6));",
+              "  const uniq = new Set(depths);",
+              "  pm.expect(uniq.size).to.eql(depths.length);",
+              "});",
+              "pm.test('rows strictly in boundary window', () => {",
+              "  const fromD = 12599, toD = 12601;",
+              "  j.rows.forEach(r => {",
+              "    const d = Number(r.depth);",
+              "    pm.expect(d).to.be.at.least(fromD);",
+              "    pm.expect(d).to.be.at.most(toD);",
+              "  });",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "E) R3 Zoom detail test",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-data?metric={{metricMain}}&fromDepth=11620&toDepth=11680&pixelWidth=1800",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-data"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "11620"
+            },
+            {
+              "key": "toDepth",
+              "value": "11680"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "1800"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('ok=true', () => pm.expect(j.ok).to.eql(true));",
+              "pm.test('zoom rows exist', () => pm.expect((j.rows || []).length).to.be.greaterThan(0));",
+              "const level = j.level ?? (j.plan && j.plan.level) ?? (j.levelUsed);",
+              "if (level !== undefined) pm.environment.set('zoom_level', String(level));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "F) window-plan overview low pixel budget",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-plan?metric={{metricMain}}&fromDepth=10608.2&toDepth=12584.69&pixelWidth=400",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-plan"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "10608.2"
+            },
+            {
+              "key": "toDepth",
+              "value": "12584.69"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "400"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('plan status ok', () => pm.expect(j.ok ?? true).to.eql(true));",
+              "pm.test('plan has source + level', () => {",
+              "  pm.expect(j.source || (j.plan && j.plan.source)).to.exist;",
+              "  pm.expect(j.level ?? (j.plan && j.plan.levelChosen)).to.not.be.undefined;",
+              "});",
+              "pm.test('estimated points exists', () => {",
+              "  const ep = j.estimatedPoints ?? (j.plan && j.plan.estimatedPoints);",
+              "  pm.expect(Number.isFinite(Number(ep))).to.eql(true);",
+              "});",
+              "pm.test('tiles stats exists', () => {",
+              "  pm.expect(typeof (j.tilesHit ?? (j.plan && j.plan.tilesHit))).to.not.eql('undefined');",
+              "  pm.expect(typeof (j.tilesMiss ?? (j.plan && j.plan.tilesMiss))).to.not.eql('undefined');",
+              "});",
+              "const lvl = Number(j.level ?? (j.plan && j.plan.levelChosen));",
+              "pm.environment.set('plan_level_lowpx', String(lvl));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "G) window-plan zoom high pixel budget",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/well/{{wellId}}/window-plan?metric={{metricMain}}&fromDepth=10608.2&toDepth=12584.69&pixelWidth=1800",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "well",
+            "{{wellId}}",
+            "window-plan"
+          ],
+          "query": [
+            {
+              "key": "metric",
+              "value": "{{metricMain}}"
+            },
+            {
+              "key": "fromDepth",
+              "value": "10608.2"
+            },
+            {
+              "key": "toDepth",
+              "value": "12584.69"
+            },
+            {
+              "key": "pixelWidth",
+              "value": "1800"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "const lvlHigh = Number(j.level ?? (j.plan && j.plan.levelChosen));",
+              "const lvlLow = Number(pm.environment.get('plan_level_lowpx') || '999');",
+              "pm.test('high pixel should choose finer or equal level', () => pm.expect(lvlHigh).to.be.at.most(lvlLow));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "H) Sparse/null quality gate via interpret",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"wellId\": \"{{wellId}}\",\n  \"fromDepth\": 12428.6,\n  \"toDepth\": 13333.7,\n  \"curves\": [\n    \"{{metricSparse}}\"\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/ai/interpret",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "ai",
+            "interpret"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "pm.test('status structured + ok true', () => {",
+              "  pm.expect(j).to.be.an('object');",
+              "  pm.expect(j.ok).to.eql(true);",
+              "});",
+              "pm.test('deterministic present', () => {",
+              "  pm.expect(j.deterministic).to.be.an('object');",
+              "  pm.expect(j.deterministic.dataQuality).to.be.an('object');",
+              "});",
+              "pm.test('quality warning appears for sparse/null curve', () => {",
+              "  const lim = (j.narrative && j.narrative.limitations) || [];",
+              "  pm.expect(Array.isArray(lim)).to.eql(true);",
+              "  const text = lim.join(' ').toLowerCase();",
+              "  pm.expect(text).to.satisfy(s => s.includes('finite') || s.includes('null') || s.includes('missing') || s.includes('confidence downgraded'));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "I) Multi-curve evidence test I2 via interpret",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"wellId\": \"{{wellId}}\",\n  \"fromDepth\": 10608.2,\n  \"toDepth\": 12584.69,\n  \"curves\": [\n    \"{{metricMain}}\",\n    \"{{metricSecond}}\",\n    \"{{metricSparse}}\"\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/ai/interpret",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "ai",
+            "interpret"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const j = pm.response.json();",
+              "const intervals = (((j || {}).deterministic || {}).intervalFindings) || [];",
+              "pm.test('intervalFindings exists', () => {",
+              "  pm.expect(intervals).to.be.an('array');",
+              "  pm.expect(intervals.length).to.be.greaterThan(0);",
+              "});",
+              "pm.test('at least one multi-curve interval exists', () => {",
+              "  const multi = intervals.filter(x => (x.evidenceType === 'multi-curve') || Number(x.curvesSupporting) >= 2);",
+              "  pm.expect(multi.length).to.be.at.least(1);",
+              "});",
+              "pm.test('all intervals have evidenceType + curvesSupporting', () => {",
+              "  intervals.forEach(x => {",
+              "    pm.expect(x).to.have.property('evidenceType');",
+              "    pm.expect(Number(x.curvesSupporting)).to.be.at.least(1);",
+              "  });",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

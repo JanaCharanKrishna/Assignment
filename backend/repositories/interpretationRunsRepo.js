@@ -111,3 +111,13 @@ export async function listInterpretationRuns({
   const r = await pgPool.query(q, vals);
   return r.rows;
 }
+
+export async function deleteInterpretationRunById(runId) {
+  const q = `
+    DELETE FROM interpretation_runs
+    WHERE run_id = $1
+    RETURNING run_id;
+  `;
+  const r = await pgPool.query(q, [runId]);
+  return r.rows[0] || null;
+}

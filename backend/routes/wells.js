@@ -7,6 +7,9 @@ import { parseLasText } from "../parsers/ParseLas.js";
 import { cacheGetJson, cacheSetJson } from "../cache/redisCache.js";
 import { overviewKey, windowKey } from "../utils/keyBuilder.js";
 import { downsampleMinMax } from "../utils/downsample.js";
+import { getRedis } from "../db/redis.js";
+import { buildWindowPlan } from "../services/windowPlanService.js";
+import { fetchWindowData } from "../services/windowFetchService.js";
 
 
 const router = express.Router();
@@ -228,6 +231,96 @@ router.get("/well/:wellId/window", async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message || "window failed" });
+  }
+});
+
+/**
+ * GET /api/well/:wellId/window-plan?metric=HC1__2&from=1000&to=1200&pixelWidth=1200
+ */
+router.get("/well/:wellId/window-plan", async (req, res) => {
+  try {
+    const { wellId } = req.params;
+    const metric = String(req.query.metric || "").trim();
+    const fromDepth = Number(req.query.from ?? req.query.fromDepth);
+    const toDepth = Number(req.query.to ?? req.query.toDepth);
+    const pixelWidth = Number(req.query.pixelWidth || req.query.px || 1200);
+
+    if (!metric) return res.status(400).json({ error: "metric is required" });
+    if (!Number.isFinite(fromDepth) || !Number.isFinite(toDepth)) {
+      return res.status(400).json({ error: "from and to are required numbers" });
+    }
+
+    const db = getDb();
+    const well = await db.collection("wells").findOne({ wellId }, { projection: { _id: 0, metrics: 1 } });
+    if (!well) return res.status(404).json({ error: "Well not found" });
+    if (!Array.isArray(well.metrics) || !well.metrics.includes(metric)) {
+      return res.status(400).json({ error: `metric not found in well: ${metric}` });
+    }
+
+    const redis = getRedis();
+    const payload = await buildWindowPlan({
+      redisClient: redis,
+      db,
+      wellId,
+      metric,
+      fromDepth,
+      toDepth,
+      pixelWidth,
+    });
+    return res.json({
+      ok: true,
+      ...payload,
+      // compatibility fields for smoke tests
+      source: payload?.plan?.source,
+      level: payload?.plan?.levelChosen,
+      estimatedPoints: payload?.plan?.estimatedPoints,
+      tilesRequested: payload?.plan?.tilesTotal,
+      tilesHit: payload?.plan?.tilesHit,
+      tilesMiss: payload?.plan?.tilesMiss,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "window-plan failed" });
+  }
+});
+
+/**
+ * GET /api/well/:wellId/window-data?metric=HC1__2&from=1000&to=1200&pixelWidth=1200
+ */
+router.get("/well/:wellId/window-data", async (req, res) => {
+  try {
+    const { wellId } = req.params;
+    const metric = String(req.query.metric || "").trim();
+    const fromDepth = Number(req.query.from ?? req.query.fromDepth);
+    const toDepth = Number(req.query.to ?? req.query.toDepth);
+    const pixelWidth = Number(req.query.pixelWidth || req.query.px || 1200);
+
+    if (!metric) return res.status(400).json({ error: "metric is required" });
+    if (!Number.isFinite(fromDepth) || !Number.isFinite(toDepth)) {
+      return res.status(400).json({ error: "from and to are required numbers" });
+    }
+
+    const db = getDb();
+    const well = await db.collection("wells").findOne({ wellId }, { projection: { _id: 0, metrics: 1 } });
+    if (!well) return res.status(404).json({ error: "Well not found" });
+    if (!Array.isArray(well.metrics) || !well.metrics.includes(metric)) {
+      return res.status(400).json({ error: `metric not found in well: ${metric}` });
+    }
+
+    const redis = getRedis();
+    const payload = await fetchWindowData({
+      redisClient: redis,
+      db,
+      wellId,
+      metric,
+      fromDepth,
+      toDepth,
+      pixelWidth,
+    });
+    return res.json(payload);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "window-data failed" });
   }
 });
 
