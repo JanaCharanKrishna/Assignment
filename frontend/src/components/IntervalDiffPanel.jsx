@@ -19,7 +19,6 @@ export default function IntervalDiffPanel({ wellId, selectedMetrics = [], range 
   const [aTo, setATo] = React.useState("");
   const [bFrom, setBFrom] = React.useState("");
   const [bTo, setBTo] = React.useState("");
-  const [detailLevel, setDetailLevel] = React.useState(3);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
   const [diff, setDiff] = React.useState(null);
@@ -50,7 +49,6 @@ export default function IntervalDiffPanel({ wellId, selectedMetrics = [], range 
           toDepth: Number(bTo),
           curves: selectedMetrics,
         },
-        detailLevel,
       };
       setLoading(true);
       setError("");
@@ -90,19 +88,6 @@ export default function IntervalDiffPanel({ wellId, selectedMetrics = [], range 
             <input className="dash-input" type="number" value={bTo} onChange={(e) => setBTo(e.target.value)} placeholder="To" />
           </div>
         </div>
-      </div>
-
-      <div className="mt-2 flex items-center gap-2 text-xs text-zinc-400">
-        <label htmlFor="detail">Detail</label>
-        <input
-          id="detail"
-          type="range"
-          min="1"
-          max="5"
-          value={detailLevel}
-          onChange={(e) => setDetailLevel(Number(e.target.value))}
-        />
-        <span>{detailLevel}</span>
       </div>
 
       {error ? <p className="mt-2 text-sm text-rose-300">{error}</p> : null}

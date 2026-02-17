@@ -1,6 +1,8 @@
 import React from "react";
 import { getEventTimeline } from "../services/api";
 
+const REQUEST_DEBOUNCE_MS = 240;
+
 function bgForBucket(bucket) {
   const density = Number(bucket?.density || 0);
   const conf = Number(bucket?.maxConfidence || 0);
@@ -20,38 +22,61 @@ export default function TimelineStrip({
   const [timeline, setTimeline] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
+  const abortRef = React.useRef(null);
+  const debounceRef = React.useRef(null);
 
   React.useEffect(() => {
-    if (!wellId || !Number.isFinite(Number(fromDepth)) || !Number.isFinite(Number(toDepth)) || !curves.length) {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+
+    const from = Number(fromDepth);
+    const to = Number(toDepth);
+    const hasRange = Number.isFinite(from) && Number.isFinite(to) && from !== to;
+    if (!wellId || !hasRange || !curves.length) {
+      setLoading(false);
+      setError("");
       setTimeline([]);
       return;
     }
-    let cancelled = false;
-    (async () => {
-      try {
-        setLoading(true);
-        setError("");
-        const out = await getEventTimeline({
-          wellId,
-          fromDepth,
-          toDepth,
-          bucketSize,
-          curves,
-        });
-        if (!cancelled) {
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    debounceRef.current = setTimeout(() => {
+      (async () => {
+        try {
+          setLoading(true);
+          setError("");
+          const out = await getEventTimeline({
+            wellId,
+            fromDepth: lo,
+            toDepth: hi,
+            bucketSize,
+            curves,
+          }, ac.signal);
+          if (ac.signal.aborted) return;
           setTimeline(Array.isArray(out?.timeline) ? out.timeline : []);
-        }
-      } catch (e) {
-        if (!cancelled) {
+        } catch (e) {
+          if (ac.signal.aborted || String(e?.name || "") === "AbortError") return;
           setTimeline([]);
           setError(e?.message || "timeline unavailable");
+        } finally {
+          if (!ac.signal.aborted) setLoading(false);
         }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
+      })();
+    }, REQUEST_DEBOUNCE_MS);
     return () => {
-      cancelled = true;
+      ac.abort();
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
     };
   }, [wellId, fromDepth, toDepth, bucketSize, curves.join(",")]);
 
@@ -60,7 +85,7 @@ export default function TimelineStrip({
   return (
     <div className="mt-3 rounded-xl border border-white/10 bg-zinc-950/70 p-3">
       <div className="mb-2 flex items-center justify-between">
-        <h4 className="text-sm font-semibold text-zinc-100">Event Timeline Strip</h4>
+        <h4 className="text-sm font-semibold text-zinc-100">DepthAnomalyStrip</h4>
         <span className="text-xs text-zinc-400">
           {loading ? "loading..." : `${timeline.length} buckets`}
         </span>
@@ -91,4 +116,3 @@ export default function TimelineStrip({
     </div>
   );
 }
-

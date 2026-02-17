@@ -2,6 +2,11 @@ from typing import Dict, List
 
 import numpy as np
 
+from app.analysis_summary import (
+    build_summary_bullets,
+    build_summary_paragraph,
+    compute_curve_statistics,
+)
 from app.analysis_insight import build_insight
 from app.analysis_utils import (
     _band,
@@ -61,12 +66,34 @@ def analyze(rows: List[Row], curves: List[str], from_depth: float, to_depth: flo
             clipped_points_total=0,
             raw_points_total=max(1, n * max(1, len(curves))),
         )
-
-        summary = [
-            "Too few rows for robust interpretation.",
-            f"Global risk is {severity_band}; anomalies are localized within selected interval(s).",
-            f"Data quality is {dq['qualityBand']} (null={dq['nullPercent']}%, clipped={dq['clippedPercent']}%, effectiveRows={dq['effectiveRows']}).",
-        ]
+        curve_stats = compute_curve_statistics(depths=depths, data=data, curves=curves)
+        summary = build_summary_bullets(
+            from_depth=from_depth,
+            to_depth=to_depth,
+            row_count=n,
+            curves=curves,
+            curve_stats=curve_stats,
+            findings=findings,
+            anomaly_score=anomaly_score,
+            detection_conf=detection_conf,
+            severity_conf=severity_conf,
+            severity_band=severity_band,
+            data_quality=dq,
+            event_density_per_1000ft=event_density,
+            max_curve_bullets=4,
+        )
+        summary_paragraph = build_summary_paragraph(
+            from_depth=from_depth,
+            to_depth=to_depth,
+            row_count=n,
+            curves=curves,
+            findings=findings,
+            anomaly_score=anomaly_score,
+            detection_conf=detection_conf,
+            severity_band=severity_band,
+            data_quality=dq,
+            curve_stats=curve_stats,
+        )
         recommendations = ["Increase selected depth range."]
         limitations = [
             "Too few rows for robust interpretation.",
@@ -83,6 +110,7 @@ def analyze(rows: List[Row], curves: List[str], from_depth: float, to_depth: flo
             "severityConfidence": round(severity_conf, 3),
             "severityBand": severity_band,
             "dataQuality": dq,
+            "curveStatistics": curve_stats,
             "thresholds": {
                 "anomalyScore": {
                     "low_to_moderate": 0.25,
@@ -100,6 +128,7 @@ def analyze(rows: List[Row], curves: List[str], from_depth: float, to_depth: flo
                 },
             },
             "summary": summary,
+            "summaryParagraph": summary_paragraph,
             "intervalFindings": findings,
             "recommendations": recommendations,
             "limitations": limitations,
@@ -276,21 +305,34 @@ def analyze(rows: List[Row], curves: List[str], from_depth: float, to_depth: flo
     if len(findings) == 0:
         anomaly_score = min(anomaly_score, 0.49)   # caps at MODERATE
         severity_conf = min(severity_conf, 0.55)
-
-    type_counts = {}
-    for f in findings:
-        type_counts[f["reason"]] = type_counts.get(f["reason"], 0) + 1
-    type_str = ", ".join([f"{k}:{v}" for k, v in sorted(type_counts.items())]) if type_counts else "none"
-
-    summary = [
-        f"Processed {n} rows across {len(curves)} curve(s).",
-        f"Detected {len(findings)} consolidated anomalous interval(s).",
-        f"Anomaly score {anomaly_score:.3f}, detection confidence {detection_conf:.3f}, severity confidence {severity_conf:.3f}.",
-        f"Interval types -> {type_str}.",
-        f"Global risk is {severity_band}; anomalies are localized within selected interval(s).",
-        "Global risk reflects aggregate behavior over the selected window; interval priority ranks local anomalies only.",
-        f"Data quality is {dq['qualityBand']} (null={dq['nullPercent']}%, clipped={dq['clippedPercent']}%, effectiveRows={dq['effectiveRows']}).",
-    ]
+    curve_stats = compute_curve_statistics(depths=depths, data=data, curves=curves)
+    summary = build_summary_bullets(
+        from_depth=from_depth,
+        to_depth=to_depth,
+        row_count=n,
+        curves=curves,
+        curve_stats=curve_stats,
+        findings=findings,
+        anomaly_score=anomaly_score,
+        detection_conf=detection_conf,
+        severity_conf=severity_conf,
+        severity_band=severity_band,
+        data_quality=dq,
+        event_density_per_1000ft=event_density,
+        max_curve_bullets=4,
+    )
+    summary_paragraph = build_summary_paragraph(
+        from_depth=from_depth,
+        to_depth=to_depth,
+        row_count=n,
+        curves=curves,
+        findings=findings,
+        anomaly_score=anomaly_score,
+        detection_conf=detection_conf,
+        severity_band=severity_band,
+        data_quality=dq,
+        curve_stats=curve_stats,
+    )
 
     recommendations = [
         "Validate top intervals against neighboring depth windows.",
@@ -315,6 +357,7 @@ def analyze(rows: List[Row], curves: List[str], from_depth: float, to_depth: flo
         "severityConfidence": round(severity_conf, 3),
         "severityBand": severity_band,
         "dataQuality": dq,
+        "curveStatistics": curve_stats,
         "thresholds": {
             "anomalyScore": {
                 "low_to_moderate": 0.25,
@@ -332,6 +375,7 @@ def analyze(rows: List[Row], curves: List[str], from_depth: float, to_depth: flo
             }
         },
         "summary": summary,
+        "summaryParagraph": summary_paragraph,
         "intervalFindings": findings,
         "recommendations": recommendations,
         "limitations": limitations,

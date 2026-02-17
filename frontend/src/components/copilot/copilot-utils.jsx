@@ -28,7 +28,7 @@ function safeArr(v) {
 function presetQuestion(mode) {
   if (mode === "data_qa") return "Why is interval flagged?";
   if (mode === "ops") return "What should drilling engineer inspect next?";
-  return "Compare current interval vs previous 500 ft.";
+  return "Why is interval flagged?";
 }
 
 export { Badge, toneForPriority, toneForConfidence, toNum, safeArr, presetQuestion };

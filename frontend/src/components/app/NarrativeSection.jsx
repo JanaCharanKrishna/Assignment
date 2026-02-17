@@ -9,14 +9,20 @@ export default function NarrativeSection({ det, nar, onJumpToInterval, selectedW
     <section className="rounded-xl border border-white/10 bg-zinc-900/70 p-3">
       <h3 className="mb-2 text-base font-semibold text-zinc-100">Interpretation Details</h3>
 
-      {Array.isArray(nar?.summary_bullets) && nar.summary_bullets.length > 0 ? (
+      {(Array.isArray(nar?.summary_bullets) && nar.summary_bullets.length > 0) ||
+      (typeof nar?.summary_paragraph === "string" && nar.summary_paragraph.trim()) ? (
         <div className="mb-3">
           <h4 className="mb-1 text-sm font-semibold text-zinc-100">Summary</h4>
-          <ul className="list-disc space-y-1 pl-5 text-sm text-zinc-300">
-            {nar.summary_bullets.map((s, i) => (
-              <li key={i}>{s}</li>
-            ))}
-          </ul>
+          {typeof nar?.summary_paragraph === "string" && nar.summary_paragraph.trim() ? (
+            <p className="mb-2 text-sm leading-relaxed text-zinc-300">{nar.summary_paragraph}</p>
+          ) : null}
+          {Array.isArray(nar?.summary_bullets) && nar.summary_bullets.length > 0 ? (
+            <ul className="list-disc space-y-1 pl-5 text-sm text-zinc-300">
+              {nar.summary_bullets.map((s, i) => (
+                <li key={i}>{s}</li>
+              ))}
+            </ul>
+          ) : null}
         </div>
       ) : null}
 

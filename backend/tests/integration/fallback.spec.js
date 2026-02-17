@@ -51,4 +51,7 @@ test("interpret returns fallback path when forced fallback is enabled", async (t
 
   assert.ok(isFallback);
   assert.ok(res.json?.modelUsed === null || typeof res.json?.modelUsed === "string");
+  assert.ok(Array.isArray(res.json?.narrative?.summary_bullets));
+  assert.ok(res.json?.narrative?.summary_bullets?.length > 0);
+  assert.equal(typeof res.json?.narrative?.summary_paragraph, "string");
 });

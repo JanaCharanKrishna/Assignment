@@ -56,13 +56,21 @@ function makeAlgoHash(parts = []) {
   return createHash("md5").update(parts.join(":")).digest("hex").slice(0, 10);
 }
 
+function isAbortLikeError(err) {
+  if (String(err?.name || "") === "AbortError") return true;
+  const msg = String(err?.message || "").toLowerCase();
+  return msg.includes("abort");
+}
+
 export async function buildEventTimeline({
   wellId,
   fromDepth,
   toDepth,
   bucketSize = 10,
   curves = [],
+  signal = null,
 }) {
+  if (signal?.aborted) throw new Error("request aborted");
   const range = normalizeRange(fromDepth, toDepth);
   if (!range) throw new Error("fromDepth and toDepth are required numbers");
   if (!Array.isArray(curves) || !curves.length) throw new Error("curves are required");
@@ -75,6 +83,7 @@ export async function buildEventTimeline({
     curves,
     limit: 80000,
   });
+  if (signal?.aborted) throw new Error("request aborted");
   let det = {};
   let findings = [];
   if ((rows || []).length < 20) {
@@ -87,10 +96,11 @@ export async function buildEventTimeline({
         toDepth: range.toDepth,
         curves,
         rows,
-      });
+      }, signal);
       det = ai?.deterministic || ai || {};
       findings = Array.isArray(det?.intervalFindings) ? det.intervalFindings : [];
     } catch (err) {
+      if (signal?.aborted || isAbortLikeError(err)) throw err;
       warnings.push(`ai_interpret_unavailable:${err?.message || "unknown_error"}`);
       det = {};
       findings = [];

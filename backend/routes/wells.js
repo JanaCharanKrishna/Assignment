@@ -2,6 +2,7 @@ import express from "express";
 import multer from "multer";
 import fs from "fs/promises";
 import path from "path";
+import { randomUUID } from "node:crypto";
 import { getDb } from "../db/mongo.js";
 import { parseLasText } from "../parsers/ParseLas.js";
 import { cacheGetJson, cacheSetJson } from "../cache/redisCache.js";
@@ -100,32 +101,37 @@ function featureVersionEnvelope({
  * form-data key: file
  */
 router.post("/las/upload", upload.single("file"), async (req, res) => {
+  let tempPath = null;
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded. form-data key must be 'file'" });
     }
-    if (!isLasS3Enabled()) {
-      return res.status(500).json({
-        error: "S3 upload is required but not configured. Set S3_LAS_BUCKET and AWS_REGION.",
-      });
-    }
+    tempPath = req.file.path;
 
     const db = getDb();
     const wellsCol = db.collection("wells");
     const pointsCol = db.collection("well_points");
 
-    const text = await fs.readFile(req.file.path, "utf8");
-    await fs.unlink(req.file.path).catch(() => {});
+    const text = await fs.readFile(tempPath, "utf8");
 
     const parsed = parseLasText(text);
 
-    const wellId = `WELL_${Date.now()}`;
+    const createdAt = new Date();
+    const wellId = `WELL_${createdAt.getTime()}_${randomUUID().slice(0, 8)}`;
     const name = path.parse(req.file.originalname).name || wellId;
-    const s3Object = await uploadLasTextToS3({
-      wellId,
-      originalName: req.file.originalname,
-      text,
-    });
+    let s3Object = null;
+    let storageWarning = null;
+    if (isLasS3Enabled()) {
+      try {
+        s3Object = await uploadLasTextToS3({
+          wellId,
+          originalName: req.file.originalname,
+          text,
+        });
+      } catch (err) {
+        storageWarning = err?.message || "S3 upload failed";
+      }
+    }
 
     // metrics: all curves except depth curve (assume first is depth)
     const metricIds = parsed.curves.slice(1).map((c) => c.id).filter((id) => !isTimeCurveIdOrName(id));
@@ -145,8 +151,9 @@ router.post("/las/upload", upload.single("file"), async (req, res) => {
       depthCurveId: parsed.depthCurveId,
       pointCount: parsed.rows.length,
       version,
-      lasObject: s3Object,
-      createdAt: new Date(),
+      sourceFileName: req.file.originalname || null,
+      lasObject: s3Object || null,
+      createdAt,
     });
 
     // store points in bulk
@@ -165,15 +172,22 @@ router.post("/las/upload", upload.single("file"), async (req, res) => {
 
     return res.json({
       ok: true,
-      well: { wellId, name, version },
+      well: { wellId, name, version, uploadedAt: createdAt.toISOString() },
       metrics: metricIds,
       points: parsed.rows.length,
       meta: { minDepth: parsed.minDepth, maxDepth: parsed.maxDepth, nullValue: parsed.nullValue },
-      storage: { provider: "s3", bucket: s3Object.bucket, key: s3Object.key, region: s3Object.region },
+      storage: s3Object
+        ? { provider: "s3", bucket: s3Object.bucket, key: s3Object.key, region: s3Object.region }
+        : { provider: "db_only" },
+      warning: storageWarning,
     });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message || "Upload/parse/store failed" });
+  } finally {
+    if (tempPath) {
+      await fs.unlink(tempPath).catch(() => {});
+    }
   }
 });
 
@@ -410,6 +424,9 @@ router.get("/well/:wellId/event-timeline", async (req, res) => {
   const meta = responseMeta(req);
   const startedAt = Date.now();
   const warnings = [];
+  const requestAbort = new AbortController();
+  const onClose = () => requestAbort.abort();
+  req.on("close", onClose);
   const version = featureVersionEnvelope({
     featureName: "event-timeline",
     featureVersion: TIMELINE_FEATURE_VERSION,
@@ -453,6 +470,7 @@ router.get("/well/:wellId/event-timeline", async (req, res) => {
     const cacheKey = `well:event-timeline:${wellId}:${Math.min(fromDepth, toDepth)}:${Math.max(fromDepth, toDepth)}:b${bucketSize}:m${metricsHash(curves)}:v${algoVersion}`;
     const cached = await cacheGetJson(cacheKey);
     if (cached) {
+      if (requestAbort.signal.aborted) return;
       eventTimelineDuration.labels("ok").observe(Date.now() - startedAt);
       logger.info({
         msg: "feature.complete",
@@ -483,13 +501,16 @@ router.get("/well/:wellId/event-timeline", async (req, res) => {
       });
     }
 
+    if (requestAbort.signal.aborted) return;
     const timeline = await buildEventTimeline({
       wellId,
       fromDepth,
       toDepth,
       bucketSize,
       curves,
+      signal: requestAbort.signal,
     });
+    if (requestAbort.signal.aborted) return;
 
     const payload = {
       wellId: timeline.wellId,
@@ -531,6 +552,7 @@ router.get("/well/:wellId/event-timeline", async (req, res) => {
       source: "fresh",
     });
   } catch (err) {
+    if (requestAbort.signal.aborted) return;
     eventTimelineDuration.labels("error").observe(Date.now() - startedAt);
     featureErrorTotal.labels("event-timeline", "runtime").inc();
     return res.status(400).json({
@@ -541,6 +563,8 @@ router.get("/well/:wellId/event-timeline", async (req, res) => {
       warnings,
       errors: [err?.message || "event timeline failed"],
     });
+  } finally {
+    req.off("close", onClose);
   }
 });
 

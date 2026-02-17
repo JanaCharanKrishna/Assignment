@@ -1,4 +1,5 @@
 import React from "react";
+import { useSearchParams } from "react-router-dom";
 import { ChartAreaInteractive } from "../components/chart-area-interactive.jsx";
 import InterpretationPanel from "../components/app/InterpretationPanel.jsx";
 import TimelineStrip from "../components/TimelineStrip.jsx";
@@ -9,10 +10,26 @@ import {
 } from "../services/api";
 import { isSameRange } from "../components/app/ui.jsx";
 
+function parseWellRange(meta) {
+  const minDepth = Number(meta?.minDepth);
+  const maxDepth = Number(meta?.maxDepth);
+  if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth) || minDepth === maxDepth) {
+    return null;
+  }
+  return {
+    fromDepth: Math.min(minDepth, maxDepth),
+    toDepth: Math.max(minDepth, maxDepth),
+  };
+}
+
 export default function App() {
-  const [selectedWellId, setSelectedWellId] = React.useState("");
+  const [searchParams] = useSearchParams();
+  const preferredWellId = String(searchParams.get("wellId") || "").trim();
+  const [selectedWellId, setSelectedWellId] = React.useState(preferredWellId);
   const [selectedMetrics, setSelectedMetrics] = React.useState([]);
   const [zoomDomain, setZoomDomain] = React.useState(null);
+  const [selectedWellRange, setSelectedWellRange] = React.useState(null);
+  const [viewportRange, setViewportRange] = React.useState(null);
 
   const [exportingPdf, setExportingPdf] = React.useState(false);
   const [interpLoading, setInterpLoading] = React.useState(false);
@@ -24,6 +41,25 @@ export default function App() {
   const [selectedInterval, setSelectedInterval] = React.useState(null);
   const [rangeFromInput, setRangeFromInput] = React.useState("");
   const [rangeToInput, setRangeToInput] = React.useState("");
+  const handleSelectedWellMetaChange = React.useCallback((meta) => {
+    const next = parseWellRange(meta);
+    setSelectedWellRange((prev) => {
+      if (!next && !prev) return prev;
+      if (!next || !prev) return next;
+      if (prev.fromDepth === next.fromDepth && prev.toDepth === next.toDepth) return prev;
+      return next;
+    });
+  }, []);
+
+  React.useEffect(() => {
+    if (preferredWellId && preferredWellId !== selectedWellId) {
+      setSelectedWellId(preferredWellId);
+    }
+  }, [preferredWellId, selectedWellId]);
+
+  React.useEffect(() => {
+    setViewportRange(null);
+  }, [selectedWellId]);
 
   React.useEffect(() => {
     if (Array.isArray(zoomDomain) && zoomDomain.length === 2) {
@@ -33,11 +69,18 @@ export default function App() {
         setRangeFromInput(String(lo));
         setRangeToInput(String(hi));
       }
+    } else if (
+      selectedWellRange &&
+      Number.isFinite(Number(selectedWellRange.fromDepth)) &&
+      Number.isFinite(Number(selectedWellRange.toDepth))
+    ) {
+      setRangeFromInput(String(selectedWellRange.fromDepth));
+      setRangeToInput(String(selectedWellRange.toDepth));
     } else {
       setRangeFromInput("");
       setRangeToInput("");
     }
-  }, [zoomDomain]);
+  }, [zoomDomain, selectedWellRange]);
 
   function buildExportPayload() {
     return {
@@ -86,14 +129,19 @@ export default function App() {
 
       if (!selectedWellId) throw new Error("Select a well first");
       if (!selectedMetrics || selectedMetrics.length === 0) throw new Error("Select at least one curve");
-      if (!zoomDomain || zoomDomain.length !== 2) throw new Error("Select/zoom a depth range first");
 
-      const z0 = Number(zoomDomain[0]);
-      const z1 = Number(zoomDomain[1]);
-      if (!Number.isFinite(z0) || !Number.isFinite(z1)) throw new Error("Invalid zoom range");
-
-      const fromDepth = Math.min(z0, z1);
-      const toDepth = Math.max(z0, z1);
+      const z0 = Array.isArray(zoomDomain) ? Number(zoomDomain[0]) : NaN;
+      const z1 = Array.isArray(zoomDomain) ? Number(zoomDomain[1]) : NaN;
+      const hasZoomRange = Number.isFinite(z0) && Number.isFinite(z1) && z0 !== z1;
+      const fromDepth = hasZoomRange
+        ? Math.min(z0, z1)
+        : Number(selectedWellRange?.fromDepth);
+      const toDepth = hasZoomRange
+        ? Math.max(z0, z1)
+        : Number(selectedWellRange?.toDepth);
+      if (!Number.isFinite(fromDepth) || !Number.isFinite(toDepth)) {
+        throw new Error("Well depth range is not ready yet. Please wait a moment and retry.");
+      }
 
       const res = await runAiInterpretation({
         wellId: selectedWellId,
@@ -156,6 +204,7 @@ export default function App() {
 
   function handleResetDepthRange() {
     setZoomDomain(null);
+    setViewportRange(null);
     setSelectedInterval(null);
     setInterpError("");
   }
@@ -171,6 +220,7 @@ export default function App() {
           toDepth: Math.max(Number(zoomDomain[0]), Number(zoomDomain[1])),
         }
       : null;
+  const defaultRange = selectedWellRange || lastRunRange || null;
 
   const isStale = !!interpResult && !!viewRange && !!lastRunRange && !isSameRange(viewRange, lastRunRange);
   const summaryCards = [
@@ -250,12 +300,14 @@ export default function App() {
               onSelectedMetricsChange={setSelectedMetrics}
               zoomDomain={zoomDomain}
               onZoomDomainChange={setZoomDomain}
+              onSelectedWellMetaChange={handleSelectedWellMetaChange}
+              onViewportRangeChange={setViewportRange}
             />
 
             <TimelineStrip
               wellId={selectedWellId}
-              fromDepth={viewRange?.fromDepth ?? lastRunRange?.fromDepth}
-              toDepth={viewRange?.toDepth ?? lastRunRange?.toDepth}
+              fromDepth={viewportRange?.fromDepth ?? viewRange?.fromDepth ?? defaultRange?.fromDepth}
+              toDepth={viewportRange?.toDepth ?? viewRange?.toDepth ?? defaultRange?.toDepth}
               curves={selectedMetrics}
               bucketSize={10}
               onBucketClick={(bucket) => handleJumpToInterval(bucket.from, bucket.to)}

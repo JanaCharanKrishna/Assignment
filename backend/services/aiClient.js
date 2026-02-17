@@ -2,9 +2,14 @@
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://127.0.0.1:8000";
 const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 45000);
 
-export async function callAiInterpret(payload) {
+export async function callAiInterpret(payload, externalSignal = null) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+  const onAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) onAbort();
+    else externalSignal.addEventListener("abort", onAbort, { once: true });
+  }
 
   try {
     const res = await fetch(`${AI_SERVICE_URL}/interpret`, {
@@ -28,10 +33,14 @@ export async function callAiInterpret(payload) {
     return json;
   } catch (err) {
     if (err?.name === "AbortError") {
+      if (externalSignal?.aborted) {
+        throw new Error("AI request aborted");
+      }
       throw new Error(`AI service timeout after ${AI_TIMEOUT_MS}ms at ${AI_SERVICE_URL}/interpret`);
     }
     throw new Error(`AI service unreachable at ${AI_SERVICE_URL}/interpret: ${err?.message || err}`);
   } finally {
     clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", onAbort);
   }
 }

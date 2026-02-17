@@ -103,7 +103,7 @@ export default function CopilotPanel({
   const initialMessage = React.useMemo(
     () => ({
       role: "assistant",
-      text: "Ask about interval flags, operational actions, or compare mode. I will answer from interpreted evidence.",
+      text: "Ask about interval flags or operational actions. I will answer from interpreted evidence.",
     }),
     []
   );
@@ -236,7 +236,6 @@ export default function CopilotPanel({
           <SelectContent>
             <SelectItem value="data_qa">Data Q&A</SelectItem>
             <SelectItem value="ops">Ops</SelectItem>
-            <SelectItem value="compare">Compare</SelectItem>
           </SelectContent>
         </Select>
 

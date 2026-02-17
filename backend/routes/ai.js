@@ -234,9 +234,14 @@ function fallbackNarrativeFromDeterministic(deterministic) {
   const detIntervals = Array.isArray(deterministic?.intervalFindings)
     ? deterministic.intervalFindings
     : [];
+  const summaryParagraph =
+    typeof deterministic?.summaryParagraph === "string"
+      ? deterministic.summaryParagraph
+      : "";
 
   return {
     summary_bullets: deterministic?.summary || [],
+    summary_paragraph: summaryParagraph,
     interval_explanations: detIntervals.map(detFindingToNarrativeInterval),
     recommendations: deterministic?.recommendations || [],
     limitations: pickLimitations(deterministic),
@@ -902,12 +907,41 @@ async function maybeGroqNarrative({
       return `- ${curve}: min=${num(s.min, 4)}, max=${num(s.max, 4)}, mean=${num(s.mean, 4)}, points=${nn}`;
     })
     .join("\n");
+  const detCurveStats = deterministic?.curveStatistics && typeof deterministic.curveStatistics === "object"
+    ? deterministic.curveStatistics
+    : {};
+  const curveStatsRichText = toArr(curves)
+    .map((curve) => {
+      const s = detCurveStats?.[curve] || {};
+      const count = Number(s?.count || 0);
+      if (count <= 0) return `- ${curve}: no valid points`;
+      return [
+        `- ${curve}:`,
+        `min=${num(s?.min, 4)}`,
+        `max=${num(s?.max, 4)}`,
+        `mean=${num(s?.mean, 4)}`,
+        `std=${num(s?.std, 4)}`,
+        `p10=${num(s?.p10, 4)}`,
+        `p90=${num(s?.p90, 4)}`,
+        `trend=${String(s?.trend || "unknown")}`,
+        `outliers=${Number(s?.outlierCount || 0)} (${num(s?.outlierPct, 2)}%)`,
+        `count=${count}`,
+      ].join(" ");
+    })
+    .join("\n");
+  const deterministicSummaryParagraph =
+    typeof deterministic?.summaryParagraph === "string" && deterministic.summaryParagraph.trim()
+      ? deterministic.summaryParagraph.trim()
+      : typeof insight?.summaryParagraph === "string" && insight.summaryParagraph.trim()
+      ? insight.summaryParagraph.trim()
+      : "";
 
   const prompt = `
 You are a petroleum/well-log interpretation assistant.
 
 Return STRICT JSON with keys:
 - summary_bullets: string[]
+- summary_paragraph: string
 - interval_explanations: [{curve,fromDepth,toDepth,explanation,confidence,priority,probability,stability,stabilityScore,agreement,width,curvesSupporting,reason,score}]
 - recommendations: string[]
 - limitations: string[]
@@ -928,8 +962,14 @@ eventDensityPer1000ft=${deterministic?.eventDensityPer1000ft}
 Insight summary:
 ${insight?.summaryParagraph || ""}
 
+Deterministic summary paragraph:
+${deterministicSummaryParagraph}
+
 Curve statistics:
 ${curveStatsText}
+
+Enhanced curve statistics:
+${curveStatsRichText}
 
 Derived diagnostics:
 ${diag.text}
@@ -941,6 +981,7 @@ Rules:
 - Use cautious language: "suggests", "likely", "requires validation"
 - Do NOT claim lab-confirmed fluid type
 - Keep recommendations concise and operational
+- summary_bullets MUST contain 7 to 8 concise bullet lines.
 - Every summary bullet and interval explanation must reference numeric evidence (depths, trend, mean/max, or correlation).
 - Avoid generic phrases like "varied behavior" without a number or curve-specific anchor.
 - IMPORTANT: If eventCount is 0, interval_explanations MUST be []
@@ -988,12 +1029,44 @@ Rules:
       detIntervals.length === 0
         ? []
         : mergeNarrativeIntervals(parsed?.interval_explanations, deterministic);
+    const parsedSummaryBullets = Array.isArray(parsed?.summary_bullets)
+      ? parsed.summary_bullets.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+    const fallbackSummaryBullets = Array.isArray(deterministic?.summary)
+      ? deterministic.summary.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+    const preferredSummaryBullets =
+      parsedSummaryBullets.length >= 7 ? parsedSummaryBullets : fallbackSummaryBullets;
+    const mergedSummaryBullets = preferredSummaryBullets.slice(0, 8);
+    if (mergedSummaryBullets.length < 7) {
+      const fillPool = [
+        ...fallbackSummaryBullets,
+        "Cross-validate flagged zones with adjacent intervals and companion logs.",
+        "Use these results as screening evidence and confirm with domain review before action.",
+      ]
+        .map((x) => String(x || "").trim())
+        .filter(Boolean);
+      for (const line of fillPool) {
+        if (mergedSummaryBullets.length >= 7) break;
+        if (!mergedSummaryBullets.includes(line)) mergedSummaryBullets.push(line);
+      }
+    }
+    const parsedSummaryParagraph =
+      typeof parsed?.summary_paragraph === "string" ? parsed.summary_paragraph.trim() : "";
+    const fallbackSummaryParagraph =
+      typeof deterministic?.summaryParagraph === "string" && deterministic.summaryParagraph.trim()
+        ? deterministic.summaryParagraph.trim()
+        : typeof insight?.summaryParagraph === "string" && insight.summaryParagraph.trim()
+        ? insight.summaryParagraph.trim()
+        : "";
+    const mergedSummaryParagraph = parsedSummaryParagraph || fallbackSummaryParagraph || "";
 
     return {
       modelUsed: GROQ_MODEL,
       narrativeStatus: detIntervals.length === 0 ? "deterministic_no_events" : "llm_ok",
       narrative: {
-        summary_bullets: parsed?.summary_bullets || deterministic?.summary || [],
+        summary_bullets: mergedSummaryBullets,
+        summary_paragraph: mergedSummaryParagraph,
         interval_explanations: mergedIntervals,
         recommendations:
           parsed?.recommendations || deterministic?.recommendations || [],
@@ -1995,6 +2068,34 @@ function buildSchemaFromAnswerText(answerText) {
 
 function syncNarrativeWithDeterministic(narrative, deterministic) {
   const nar = narrative && typeof narrative === "object" ? { ...narrative } : {};
+  const detSummaryBullets = Array.isArray(deterministic?.summary)
+    ? deterministic.summary.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  const narSummaryBullets = Array.isArray(nar.summary_bullets)
+    ? nar.summary_bullets.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  const mergedBullets = [...narSummaryBullets];
+  for (const line of detSummaryBullets) {
+    if (!mergedBullets.includes(line)) mergedBullets.push(line);
+    if (mergedBullets.length >= 8) break;
+  }
+  if (mergedBullets.length < 7) {
+    for (const line of [
+      "Cross-validate flagged zones with adjacent intervals and companion logs.",
+      "Use these results as screening evidence and confirm with domain review before action.",
+    ]) {
+      if (mergedBullets.length >= 7) break;
+      if (!mergedBullets.includes(line)) mergedBullets.push(line);
+    }
+  }
+  nar.summary_bullets = mergedBullets.slice(0, 8);
+  if (typeof nar.summary_paragraph !== "string" || !nar.summary_paragraph.trim()) {
+    if (typeof deterministic?.summaryParagraph === "string" && deterministic.summaryParagraph.trim()) {
+      nar.summary_paragraph = deterministic.summaryParagraph;
+    } else {
+      nar.summary_paragraph = "";
+    }
+  }
   const detIntervals = Array.isArray(deterministic?.intervalFindings)
     ? deterministic.intervalFindings
     : [];

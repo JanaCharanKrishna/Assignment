@@ -21,6 +21,9 @@ async function safeJson(url, signal) {
   try {
     res = await fetch(url, { signal });
   } catch (err) {
+    if (String(err?.name || "") === "AbortError") {
+      throw err;
+    }
     const origin = (() => {
       try {
         return new URL(url).origin;

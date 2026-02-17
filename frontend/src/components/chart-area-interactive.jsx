@@ -10,6 +10,8 @@ export function ChartAreaInteractive({
   onSelectedMetricsChange,
   zoomDomain: zoomDomainProp,
   onZoomDomainChange,
+  onSelectedWellMetaChange,
+  onViewportRangeChange,
 }) {
   const [wells, setWells] = React.useState([]);
   const [selectedWellIdInternal, setSelectedWellIdInternal] = React.useState("");
@@ -24,13 +26,15 @@ export function ChartAreaInteractive({
   const [rangePickMode, setRangePickMode] = React.useState(false);
   const [rangePickStart, setRangePickStart] = React.useState(null);
 
-  const abortRef = React.useRef(null);
+  const overviewAbortRef = React.useRef(null);
+  const windowAbortRef = React.useRef(null);
   const debounceRef = React.useRef(null);
   const fileInputRef = React.useRef(null);
   const lastFetchedRangeRef = React.useRef(null);
   const plotWrapRef = React.useRef(null);
+  const plotRef = React.useRef(null);
+  const wheelSyncTimerRef = React.useRef(null);
   const isPointerDownRef = React.useRef(false);
-  const pendingRangeRef = React.useRef(null);
 
   const selectedWellId = selectedWellIdProp ?? selectedWellIdInternal;
   const setSelectedWellId = React.useCallback(
@@ -77,11 +81,21 @@ export function ChartAreaInteractive({
     return m;
   }, [allMetrics]);
 
+  function cancelOverviewInFlight() {
+    if (!overviewAbortRef.current) return;
+    overviewAbortRef.current.abort();
+    overviewAbortRef.current = null;
+  }
+
+  function cancelWindowInFlight() {
+    if (!windowAbortRef.current) return;
+    windowAbortRef.current.abort();
+    windowAbortRef.current = null;
+  }
+
   function cancelInFlight() {
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
-    }
+    cancelOverviewInFlight();
+    cancelWindowInFlight();
   }
 
   async function loadWells(preferredWellId = null) {
@@ -157,18 +171,18 @@ export function ChartAreaInteractive({
   }
 
   async function fetchOverview(wellId, metrics, target = 1200) {
-    cancelInFlight();
+    cancelOverviewInFlight();
     const ac = new AbortController();
-    abortRef.current = ac;
+    overviewAbortRef.current = ac;
     const m = metricsQuery(metrics);
     const url = `${API_BASE}/api/well/${wellId}/overview?metrics=${m}&target=${target}`;
     return safeJson(url, ac.signal);
   }
 
   async function fetchWindow(wellId, metrics, from, to, px = 1200) {
-    cancelInFlight();
+    cancelWindowInFlight();
     const ac = new AbortController();
-    abortRef.current = ac;
+    windowAbortRef.current = ac;
     const m = metricsQuery(metrics);
     const url = `${API_BASE}/api/well/${wellId}/window?metrics=${m}&from=${from}&to=${to}&px=${px}`;
     return safeJson(url, ac.signal);
@@ -231,9 +245,49 @@ export function ChartAreaInteractive({
       }
     })();
 
-    return () => cancelInFlight();
+    return () => {
+      cancelInFlight();
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+      if (wheelSyncTimerRef.current) clearTimeout(wheelSyncTimerRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  React.useEffect(() => {
+    if (!onSelectedWellMetaChange) return;
+    if (!selectedWell) {
+      onSelectedWellMetaChange(null);
+      return;
+    }
+    onSelectedWellMetaChange({
+      wellId: selectedWell.wellId,
+      minDepth: selectedWell.minDepth,
+      maxDepth: selectedWell.maxDepth,
+      name: selectedWell.name,
+    });
+  }, [onSelectedWellMetaChange, selectedWell]);
+
+  React.useEffect(() => {
+    setXRange(null);
+    lastFetchedRangeRef.current = null;
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    cancelInFlight();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedWellId]);
+
+  React.useEffect(() => {
+    lastFetchedRangeRef.current = null;
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+  }, [selectedWellId, selectedMetrics.join("|")]);
 
   React.useEffect(() => {
     if (!allMetrics.length) return;
@@ -247,15 +301,24 @@ export function ChartAreaInteractive({
 
   React.useEffect(() => {
     if (!selectedWellId || !selectedMetrics.length) return;
-
-    setXRange(null);
+    const a = Array.isArray(xRange) ? Number(xRange[0]) : NaN;
+    const b = Array.isArray(xRange) ? Number(xRange[1]) : NaN;
+    const hasPinnedRange = Number.isFinite(a) && Number.isFinite(b) && a !== b;
 
     (async () => {
       setLoading(true);
       setError("");
       try {
-        const ov = await fetchOverview(selectedWellId, selectedMetrics, 1200);
-        setRows(ov.rows || []);
+        if (hasPinnedRange) {
+          const lo = Math.min(a, b);
+          const hi = Math.max(a, b);
+          const win = await fetchWindow(selectedWellId, selectedMetrics, lo, hi, 1200);
+          setRows(win.rows || []);
+          lastFetchedRangeRef.current = { from: lo, to: hi };
+        } else {
+          const ov = await fetchOverview(selectedWellId, selectedMetrics, 1200);
+          setRows(ov.rows || []);
+        }
       } catch (e) {
         if (String(e?.name) === "AbortError") return;
         setError(e.message || "Overview failed");
@@ -345,35 +408,40 @@ export function ChartAreaInteractive({
       : `${selectedMetrics.length} curves selected`;
 
   function onRelayout(e) {
-    const x0 = e["xaxis.range[0]"];
-    const x1 = e["xaxis.range[1]"];
+    const rangePair =
+      Array.isArray(e?.["xaxis.range"]) && e["xaxis.range"].length === 2
+        ? e["xaxis.range"]
+        : Array.isArray(e?.xaxis?.range) && e.xaxis.range.length === 2
+        ? e.xaxis.range
+        : [e?.["xaxis.range[0]"], e?.["xaxis.range[1]"]];
+    const x0 = rangePair[0];
+    const x1 = rangePair[1];
+    const a = Number(x0);
+    const b = Number(x1);
+    const hasExplicitRange = Number.isFinite(a) && Number.isFinite(b) && a !== b;
 
-    if (e["xaxis.autorange"] === true) {
+    if (hasExplicitRange) {
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      // Always publish the current zoom to parent so dependent panels
+      // (timeline/interpretation range) stay in sync across repeated zooms.
+      if (
+        !Array.isArray(xRange) ||
+        xRange.length !== 2 ||
+        Math.abs(Number(xRange[0]) - lo) > 1e-6 ||
+        Math.abs(Number(xRange[1]) - hi) > 1e-6
+      ) {
+        setXRange([lo, hi]);
+      }
+      if (onViewportRangeChange) {
+        onViewportRangeChange({ fromDepth: lo, toDepth: hi });
+      }
+      scheduleWindowFetch(lo, hi);
+    } else if (e["xaxis.autorange"] === true) {
       setXRange(null);
+      if (onViewportRangeChange) onViewportRangeChange(null);
       scheduleWindowFetch(fullDomain[0], fullDomain[1]);
       return;
-    }
-
-    if (x0 != null && x1 != null) {
-      const a = Number(x0);
-      const b = Number(x1);
-      if (Number.isFinite(a) && Number.isFinite(b) && a !== b) {
-        const lo = Math.min(a, b);
-        const hi = Math.max(a, b);
-        if (isPointerDownRef.current) {
-          pendingRangeRef.current = [lo, hi];
-          return;
-        }
-        if (
-          !Array.isArray(xRange) ||
-          xRange.length !== 2 ||
-          Math.abs(Number(xRange[0]) - lo) > 0.25 ||
-          Math.abs(Number(xRange[1]) - hi) > 0.25
-        ) {
-          setXRange([lo, hi]);
-        }
-        scheduleWindowFetch(lo, hi);
-      }
     }
 
     if (typeof e?.dragmode === "string" && e.dragmode) {
@@ -386,7 +454,32 @@ export function ChartAreaInteractive({
     const hi = Math.max(Number(a), Number(b));
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) return;
     setXRange([lo, hi]);
+    if (onViewportRangeChange) {
+      onViewportRangeChange({ fromDepth: lo, toDepth: hi });
+    }
     scheduleWindowFetch(lo, hi);
+  }
+
+  function syncRangeFromGraphDiv() {
+    const range = plotRef.current?.layout?.xaxis?.range;
+    if (!Array.isArray(range) || range.length !== 2) return;
+    const a = Number(range[0]);
+    const b = Number(range[1]);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return;
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    if (
+      !Array.isArray(xRange) ||
+      xRange.length !== 2 ||
+      Math.abs(Number(xRange[0]) - lo) > 1e-6 ||
+      Math.abs(Number(xRange[1]) - hi) > 1e-6
+    ) {
+      setXRange([lo, hi]);
+      if (onViewportRangeChange) {
+        onViewportRangeChange({ fromDepth: lo, toDepth: hi });
+      }
+      scheduleWindowFetch(lo, hi);
+    }
   }
 
   function onPlotClick(e) {
@@ -421,17 +514,16 @@ export function ChartAreaInteractive({
     if (!isPointerDownRef.current) return;
     isPointerDownRef.current = false;
     plotWrapRef.current?.classList.remove("is-panning");
+    // Drag-zoom/pan fallback: read final visible range directly from Plotly.
+    syncRangeFromGraphDiv();
+  }
 
-    const pending = pendingRangeRef.current;
-    pendingRangeRef.current = null;
-    if (Array.isArray(pending) && pending.length === 2) {
-      const lo = Number(pending[0]);
-      const hi = Number(pending[1]);
-      if (Number.isFinite(lo) && Number.isFinite(hi) && lo !== hi) {
-        setXRange([Math.min(lo, hi), Math.max(lo, hi)]);
-        scheduleWindowFetch(lo, hi);
-      }
-    }
+  function handleWheelCapture() {
+    if (wheelSyncTimerRef.current) clearTimeout(wheelSyncTimerRef.current);
+    wheelSyncTimerRef.current = setTimeout(() => {
+      // Scroll zoom fallback: sync after wheel settles.
+      syncRangeFromGraphDiv();
+    }, 100);
   }
 
   return (
@@ -511,11 +603,15 @@ export function ChartAreaInteractive({
           ref={plotWrapRef}
           className="plot-wrap"
           style={{ height: 480 }}
+          onWheelCapture={handleWheelCapture}
           onMouseDown={handlePointerDown}
           onMouseUp={handlePointerUp}
           onMouseLeave={handlePointerUp}
         >
           <Plot
+            onInitialized={(_figure, graphDiv) => {
+              plotRef.current = graphDiv || null;
+            }}
             data={plotData}
             layout={{
               autosize: true,

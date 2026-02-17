@@ -31,20 +31,17 @@ export function isLasS3Enabled() {
   return Boolean(bucket);
 }
 
-export async function uploadLasTextToS3({ wellId, originalName, text }) {
+export async function uploadLasTextToS3({ wellId: _wellId, originalName, text }) {
   const { bucket, region, prefix } = getConfig();
   if (!bucket) {
     throw new Error("S3_LAS_BUCKET is not configured");
   }
 
   const now = new Date();
-  const yyyy = String(now.getUTCFullYear());
-  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(now.getUTCDate()).padStart(2, "0");
-
-  const safeWellId = sanitizeSegment(wellId || "well");
   const safeName = sanitizeSegment(originalName || "upload.las") || "upload.las";
-  const key = `${prefix}/${yyyy}/${mm}/${dd}/${safeWellId}/${Date.now()}-${randomUUID()}-${safeName}`;
+  const stamp = now.toISOString().replace(/[:.]/g, "-");
+  const shortId = randomUUID().slice(0, 6);
+  const key = `${prefix}/${stamp}-${shortId}-${safeName}`;
 
   const put = new PutObjectCommand({
     Bucket: bucket,

@@ -22,13 +22,106 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  askCopilot,
   downloadInterpretationPdf,
   exportInterpretationJson,
   getInterpretationRun,
   listInterpretationRuns,
 } from "@/services/api";
+import { presetQuestion, safeArr, toNum } from "@/components/copilot/copilot-utils.jsx";
+
+function formatCopilotResponse(response, mode) {
+  const result = response?.json || {};
+  const lines = [];
+
+  lines.push(`${result?.answer_title || "Copilot Answer"}`);
+  lines.push(result?.direct_answer || "No direct answer returned.");
+
+  const keyPoints = safeArr(result?.key_points);
+  if (keyPoints.length) {
+    lines.push("");
+    lines.push("Key points:");
+    for (const point of keyPoints) lines.push(`- ${point}`);
+  }
+
+  const actions = safeArr(result?.actions);
+  if (actions.length) {
+    lines.push("");
+    lines.push("Recommended actions:");
+    actions.forEach((action, index) => {
+      const priority = String(action?.priority || "medium").toUpperCase();
+      const text = action?.action || "-";
+      const rationale = action?.rationale ? ` | Why: ${action.rationale}` : "";
+      lines.push(`${index + 1}. [${priority}] ${text}${rationale}`);
+    });
+  }
+
+  if (mode === "compare" && result?.comparison) {
+    const compareSummary = result?.comparison?.summary;
+    const deltas = safeArr(result?.comparison?.delta_metrics);
+    lines.push("");
+    lines.push("Comparison:");
+    if (compareSummary) lines.push(compareSummary);
+    deltas.forEach((delta) => {
+      lines.push(
+        `- ${delta?.metric || "metric"}: current=${delta?.current ?? "-"}, baseline=${delta?.baseline ?? "-"}, delta=${delta?.delta ?? "-"}`
+      );
+    });
+  }
+
+  const risks = safeArr(result?.risks);
+  if (risks.length) {
+    lines.push("");
+    lines.push("Risks:");
+    risks.forEach((risk) => lines.push(`- ${risk}`));
+  }
+
+  const uncertainties = safeArr(result?.uncertainties);
+  if (uncertainties.length) {
+    lines.push("");
+    lines.push("Uncertainties:");
+    uncertainties.forEach((item) => lines.push(`- ${item}`));
+  }
+
+  const confidence = result?.confidence || {};
+  lines.push("");
+  lines.push(
+    `Confidence: ${confidence?.rubric || "-"} (${toNum(confidence?.overall, 2)})${confidence?.reason ? ` | ${confidence.reason}` : ""}`
+  );
+
+  const evidence = response?.evidence || null;
+  const wellId = evidence?.context_meta?.wellId || "-";
+  const fromDepth = toNum(evidence?.context_meta?.range?.fromDepth, 0);
+  const toDepth = toNum(evidence?.context_meta?.range?.toDepth, 0);
+
+  const schemaLabel =
+    response?.schema_valid === false
+      ? "fallback repaired"
+      : response?.schema_valid === true
+      ? "valid"
+      : "-";
+
+  lines.push(
+    `Meta: source=${response?.source || "-"}, evidence=${response?.evidence_strength || "-"}, schema=${schemaLabel}, latency=${Number.isFinite(Number(response?.latency_ms)) ? `${toNum(response.latency_ms, 0)} ms` : "-"}`
+  );
+  lines.push(`Context: well=${wellId}, range=${fromDepth} -> ${toDepth}`);
+
+  if (result?.safety_note) {
+    lines.push("");
+    lines.push(`Safety: ${result.safety_note}`);
+  }
+
+  return lines.join("\n");
+}
 
 export default function Reports() {
+  const initialMessage = React.useMemo(
+    () => ({
+      role: "assistant",
+      text: "Select an interpretation from the table, then ask about interval flags or operational actions.",
+    }),
+    []
+  );
   const [interpHistoryLoading, setInterpHistoryLoading] = React.useState(false);
   const [interpHistoryError, setInterpHistoryError] = React.useState("");
   const [interpHistory, setInterpHistory] = React.useState([]);
@@ -40,10 +133,10 @@ export default function Reports() {
   const [selectedRun, setSelectedRun] = React.useState(null);
   const [selectedRunLoading, setSelectedRunLoading] = React.useState(false);
   const [selectedRunError, setSelectedRunError] = React.useState("");
-  const [question, setQuestion] = React.useState("");
-  const [messages, setMessages] = React.useState([
-    { role: "assistant", text: "Select an interpretation from the table, then ask about that interpretation." },
-  ]);
+  const [mode, setMode] = React.useState("data_qa");
+  const [question, setQuestion] = React.useState(presetQuestion("data_qa"));
+  const [messages, setMessages] = React.useState([initialMessage]);
+  const [loading, setLoading] = React.useState(false);
 
   const det = selectedRun?.deterministic || null;
   const nar = selectedRun?.narrative || null;
@@ -119,6 +212,10 @@ export default function Reports() {
     setVisibleInterpCount(5);
   }, [wellFilter, statusFilter, curveFilter, sortByDate, interpHistory.length]);
 
+  React.useEffect(() => {
+    setQuestion(presetQuestion(mode));
+  }, [mode]);
+
   async function handleViewInterpretation(runId) {
     if (!runId || runId === "-") return;
     try {
@@ -130,9 +227,7 @@ export default function Reports() {
         throw new Error("Interpretation not found");
       }
       setSelectedRun(run);
-      setMessages([
-        { role: "assistant", text: `Loaded interpretation ${runId}. Ask anything about this interpretation.` },
-      ]);
+      setMessages([{ role: "assistant", text: `Loaded interpretation ${runId}. Ask Copilot about this interpretation.` }]);
     } catch (e) {
       setSelectedRunError(e?.message || "Failed to load interpretation");
       setSelectedRun(null);
@@ -181,51 +276,77 @@ export default function Reports() {
     }
   }
 
-  function answerFromInterpretation(q, run) {
-    if (!run) return "Select an interpretation first.";
-    const questionText = String(q || "").toLowerCase();
-    const detLocal = run?.deterministic || {};
-    const narLocal = run?.narrative || {};
-    const insightLocal = run?.insight || {};
+  const canAsk =
+    !!selectedRun &&
+    !!selectedRun?.wellId &&
+    Number.isFinite(Number(selectedRun?.fromDepth)) &&
+    Number.isFinite(Number(selectedRun?.toDepth)) &&
+    !!selectedRun?.deterministic &&
+    typeof selectedRun.deterministic === "object" &&
+    Object.keys(selectedRun.deterministic).length > 0;
 
-    if (/summary|overview/.test(questionText)) {
-      return [
-        `Well ${run?.wellId || run?.well_id || "-"} range ${Number(run?.fromDepth ?? run?.from_depth ?? 0).toFixed(0)} -> ${Number(run?.toDepth ?? run?.to_depth ?? 0).toFixed(0)} ft.`,
-        `Global risk: ${detLocal?.severityBand || "-"}, data quality: ${detLocal?.dataQuality?.qualityBand || "-"}.`,
-        `Event count: ${typeof detLocal?.eventCount === "number" ? detLocal.eventCount : "-"}.`,
-      ].join(" ");
-    }
-
-    if (/risk|critical|danger/.test(questionText)) {
-      return `Risk profile indicates ${detLocal?.severityBand || "-"} severity with ${detLocal?.dataQuality?.qualityBand || "-"} data quality. ${insightLocal?.riskProfile?.summary || ""}`.trim();
-    }
-
-    if (/recommend|action|next/.test(questionText)) {
-      const recs = Array.isArray(narLocal?.recommendations) ? narLocal.recommendations : [];
-      if (!recs.length) return "No recommendations were recorded for this interpretation.";
-      return recs.map((r, i) => `${i + 1}. ${r}`).join(" ");
-    }
-
-    if (/interval|zone|where/.test(questionText)) {
-      const intervals = Array.isArray(narLocal?.interval_explanations) ? narLocal.interval_explanations : [];
-      if (!intervals.length) return "No interval explanations available in this interpretation.";
-      const top = intervals[0];
-      return `Top interval: ${top?.curve || "-"} ${Number(top?.fromDepth ?? 0).toFixed(0)} -> ${Number(top?.toDepth ?? 0).toFixed(0)} ft. ${top?.explanation || ""}`.trim();
-    }
-
-    return "I can answer about summary, risk, recommendations, intervals, and key findings for this interpretation.";
-  }
-
-  function sendQuestion() {
-    if (!question.trim()) return;
-    const userText = question.trim();
-    const reply = answerFromInterpretation(userText, selectedRun);
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", text: userText },
-      { role: "assistant", text: reply },
-    ]);
+  async function sendQuestion() {
+    const userText = String(question || "").trim() || presetQuestion(mode);
+    setMessages((prev) => [...prev, { role: "user", text: userText }]);
     setQuestion("");
+
+    if (!canAsk) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: "Select and load a valid interpretation first so Copilot has deterministic evidence context." },
+      ]);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const rangeFrom = Number(selectedRun.fromDepth);
+      const baselineWidth = 500;
+      const interval = Array.isArray(selectedRun?.narrative?.interval_explanations)
+        ? selectedRun.narrative.interval_explanations[0]
+        : null;
+      const selectedInterval =
+        interval &&
+        Number.isFinite(Number(interval?.fromDepth)) &&
+        Number.isFinite(Number(interval?.toDepth))
+          ? {
+              fromDepth: Number(interval.fromDepth),
+              toDepth: Number(interval.toDepth),
+            }
+          : null;
+
+      const payload = {
+        mode,
+        question: userText,
+        wellId: selectedRun.wellId,
+        fromDepth: Number(selectedRun.fromDepth),
+        toDepth: Number(selectedRun.toDepth),
+        selectedInterval,
+        deterministic: selectedRun?.deterministic || {},
+        insight: selectedRun?.insight || {},
+        narrative: selectedRun?.narrative || {},
+        curves: Array.isArray(selectedRun?.curves) ? selectedRun.curves : [],
+        baseline: {
+          widthFt: baselineWidth,
+          range: {
+            fromDepth: rangeFrom - baselineWidth,
+            toDepth: rangeFrom,
+          },
+          deterministic: {},
+        },
+      };
+
+      const out = await askCopilot(payload);
+      const assistantText = formatCopilotResponse(out, mode);
+      setMessages((prev) => [...prev, { role: "assistant", text: assistantText }]);
+    } catch (e) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: e?.message || "Copilot failed" },
+      ]);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -403,22 +524,51 @@ export default function Reports() {
                 </span>
               </div>
             ))}
+            {loading ? (
+              <div className="text-sm leading-relaxed">
+                <Badge variant="outline" className="mr-2 rounded-full border-white/20 bg-zinc-900 px-3 py-1 text-zinc-200">
+                  assistant
+                </Badge>
+                <span className="text-zinc-400">Thinking...</span>
+              </div>
+            ) : null}
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <Select value={mode} onValueChange={setMode}>
+              <SelectTrigger className="copilot-input h-11 min-w-[180px]">
+                <SelectValue placeholder="Mode" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="data_qa">Data Q&A</SelectItem>
+                <SelectItem value="ops">Ops</SelectItem>
+              </SelectContent>
+            </Select>
             <Input
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
               placeholder="Ask anything about selected interpretation"
-              className="copilot-input"
+              className="copilot-input min-w-[320px] flex-1"
               onKeyDown={(event) => {
-                if (event.key === "Enter") sendQuestion();
+                if (event.key === "Enter" && !loading) sendQuestion();
               }}
             />
             <Button
               onClick={sendQuestion}
+              disabled={loading}
               className="h-11 rounded-xl bg-zinc-100 px-6 text-base text-zinc-950 hover:bg-white"
             >
               Send
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setMessages([initialMessage]);
+                setQuestion(presetQuestion(mode));
+              }}
+              disabled={loading}
+              className="h-11 rounded-xl"
+            >
+              Clear Chat
             </Button>
           </div>
         </CardContent>
