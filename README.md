@@ -82,6 +82,57 @@ Redis (tile+pyramid cache)          MongoDB                    PostgreSQL
 
 ---
 
+## Deployment Architecture (VPC with Private Subnets + NAT)
+
+This deployment follows the standard AWS reference architecture for running application servers in private subnets while still allowing them to securely access the internet for updates, package installs, and external APIs.
+
+![AWS VPC private subnets with NAT gateways and ALB](docs/images/vpc-private-subnets-nat.png)
+
+### High-level design
+- One VPC spanning two Availability Zones (AZs) for high availability.
+- In each AZ:
+  - Public Subnet
+    - Hosts a NAT Gateway
+    - Has a route to the Internet Gateway (IGW)
+  - Private Subnet
+    - Hosts the application servers (EC2 instances) inside an Auto Scaling Group (ASG)
+    - No direct inbound internet access
+- An Application Load Balancer (ALB) is deployed across the public subnets and is the only public entry point to the application.
+- An S3 Gateway Endpoint (VPC endpoint) is used so instances in private subnets can access S3 privately without sending traffic over the public internet.
+
+### How traffic flows
+Inbound (User -> App)
+1. Users hit the ALB (public).
+2. The ALB forwards requests to targets (EC2 instances) in the private subnets.
+3. Instances accept inbound traffic only from the ALB security group (not from the internet).
+
+Outbound (App -> Internet / Updates / APIs)
+1. Private EC2 instances send outbound traffic to the NAT Gateway in the same AZ.
+2. NAT Gateway routes traffic to the internet via the Internet Gateway (IGW).
+3. Responses return back through NAT to the private instances.
+
+Private S3 access
+- With an S3 Gateway Endpoint, private instances can communicate with S3 directly inside AWS networking, improving security and often reducing egress cost.
+
+### Security posture
+- EC2 instances remain private (no public IPs), reducing attack surface.
+- ALB is the only public component exposed to the internet.
+- Security groups typically enforce:
+  - ALB: allows inbound HTTP/HTTPS from the internet (or restricted CIDRs)
+  - EC2: allows inbound only from the ALB security group
+  - EC2 outbound: allowed (routes via NAT), with optional tightening based on needs
+
+### Why this architecture
+- High availability across two AZs
+- Scalable via Auto Scaling Group behind ALB
+- Secure by default: app servers are not publicly reachable
+- Controlled outbound access using NAT
+- Optimized AWS service access using VPC endpoints (for example, S3 gateway endpoint)
+
+Reference: [AWS VPC example - private subnets with NAT gateways](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-example-private-subnets-nat.html)
+
+---
+
 ## Repository layout
 
 ```text
