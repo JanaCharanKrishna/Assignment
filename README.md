@@ -490,6 +490,7 @@ This project is built to be fast, explainable, and dependable for real engineeri
 
 - Do not commit real API keys or cloud credentials.
 - Keep `.env` local and rotate keys that were previously exposed.
+- Production secret and configuration values are managed in AWS, using both AWS Systems Manager Parameter Store and AWS Secrets Manager.
 - Use least-privilege IAM permissions for S3 credentials.
 
 ---
