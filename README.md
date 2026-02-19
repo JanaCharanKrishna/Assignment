@@ -264,7 +264,7 @@ testing/         Golden tests, Postman collections, smoke scripts, docs
 ### 2) Clone and install dependencies
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/JanaCharanKrishna/Assignment.git
 cd Assignment
 
 cd backend && npm install
